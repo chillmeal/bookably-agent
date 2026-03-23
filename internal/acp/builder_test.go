@@ -1,11 +1,7 @@
 package acp
 
 import (
-	"fmt"
 	"testing"
-	"time"
-
-	"github.com/chillmeal/bookably-agent/internal/domain"
 )
 
 func TestBuildCancelBookingRunShape(t *testing.T) {
@@ -94,12 +90,11 @@ func TestBuildCreateBookingRunShape(t *testing.T) {
 }
 
 func TestBuildAvailabilityRunWithThreeSlots(t *testing.T) {
-	now := time.Now().UTC()
-	slots := []domain.Slot{
-		{ID: "s1", Start: now, End: now.Add(time.Hour)},
-		{ID: "s2", Start: now.Add(time.Hour), End: now.Add(2 * time.Hour)},
-		{ID: "s3", Start: now.Add(2 * time.Hour), End: now.Add(3 * time.Hour)},
+	create := []CommitCreateItem{
+		{Date: "2026-03-24", StartTime: "12:00", EndTime: "13:00"},
+		{Date: "2026-03-24", StartTime: "13:00", EndTime: "14:00"},
 	}
+	deleteIDs := []string{"s1", "s2", "s3"}
 	meta := RunMetadata{
 		ChatID:       "777",
 		SpecialistID: "spec-3",
@@ -108,30 +103,15 @@ func TestBuildAvailabilityRunWithThreeSlots(t *testing.T) {
 		RawMessage:   "Закрой диапазон",
 	}
 
-	run, err := BuildAvailabilityRun("https://api.bookably.app", "token-3", slots, "idem-base", meta)
+	run, err := BuildAvailabilityRun("https://api.bookably.app", "token-3", create, deleteIDs, "idem-base", meta)
 	if err != nil {
 		t.Fatalf("BuildAvailabilityRun: %v", err)
 	}
 
-	if len(run.Steps) != 4 {
-		t.Fatalf("expected 4 steps (3 deletes + commit), got %d", len(run.Steps))
+	if len(run.Steps) != 1 {
+		t.Fatalf("expected 1 commit step, got %d", len(run.Steps))
 	}
-
-	for idx := 0; idx < 3; idx++ {
-		step := run.Steps[idx]
-		if step.Capability != "availability.delete_slot" {
-			t.Fatalf("step %d capability mismatch: %q", idx, step.Capability)
-		}
-		if step.Config.Method != "DELETE" {
-			t.Fatalf("step %d method mismatch: %q", idx, step.Config.Method)
-		}
-		wantKey := fmt.Sprintf("idem-base:del:%d", idx)
-		if step.Config.Headers["Idempotency-Key"] != wantKey {
-			t.Fatalf("step %d idempotency key mismatch: got %q want %q", idx, step.Config.Headers["Idempotency-Key"], wantKey)
-		}
-	}
-
-	commit := run.Steps[3]
+	commit := run.Steps[0]
 	if commit.Capability != "availability.commit" {
 		t.Fatalf("commit capability mismatch: %q", commit.Capability)
 	}
@@ -140,5 +120,19 @@ func TestBuildAvailabilityRunWithThreeSlots(t *testing.T) {
 	}
 	if commit.Config.Headers["Idempotency-Key"] != "idem-base:commit" {
 		t.Fatalf("commit idempotency key mismatch: %q", commit.Config.Headers["Idempotency-Key"])
+	}
+
+	body, ok := commit.Config.Body.(CommitScheduleBody)
+	if !ok {
+		t.Fatalf("expected CommitScheduleBody, got %T", commit.Config.Body)
+	}
+	if len(body.Create) != 2 {
+		t.Fatalf("expected 2 create items, got %d", len(body.Create))
+	}
+	if len(body.Delete) != 3 {
+		t.Fatalf("expected 3 delete items, got %d", len(body.Delete))
+	}
+	if body.Delete[0].SlotID != "s1" || body.Delete[2].SlotID != "s3" {
+		t.Fatalf("unexpected delete body: %#v", body.Delete)
 	}
 }

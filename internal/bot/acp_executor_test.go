@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/chillmeal/bookably-agent/internal/acp"
 	"github.com/chillmeal/bookably-agent/internal/domain"
@@ -113,7 +114,7 @@ func TestRuntimeACPExecutorCreateBookingIsContractBlocked(t *testing.T) {
 	}
 }
 
-func TestRuntimeACPExecutorAvailabilityBlocked(t *testing.T) {
+func TestRuntimeACPExecutorAvailabilityRunShape(t *testing.T) {
 	runner := &fakeRunSubmitter{}
 	tokens := &fakeTokenProvider{token: "tok"}
 
@@ -122,21 +123,43 @@ func TestRuntimeACPExecutorAvailabilityBlocked(t *testing.T) {
 		t.Fatalf("NewRuntimeACPExecutor: %v", err)
 	}
 
-	s := &session.Session{ChatID: 12, ProviderID: "spec-1"}
+	s := &session.Session{ChatID: 12, ProviderID: "spec-1", Timezone: "Europe/Moscow"}
+	start := time.Date(2026, 3, 24, 9, 0, 0, 0, time.UTC)
+	end := start.Add(time.Hour)
 	pending := &session.PendingPlan{
 		ID:             "plan-1",
 		IdempotencyKey: "idem-1",
 		Plan: interpreter.ActionPlan{
 			Intent: interpreter.IntentSetWorkingHours,
 		},
+		Availability: &session.PendingAvailability{
+			Create: []session.PendingAvailabilityCreate{
+				{StartAt: start.Format(time.RFC3339), EndAt: end.Format(time.RFC3339)},
+			},
+			DeleteSlotIDs: []string{"slot-1"},
+		},
 	}
 
 	_, err = executor.ExecuteConfirmed(context.Background(), s, pending)
-	if err == nil {
-		t.Fatal("expected contract blocked error")
+	if err != nil {
+		t.Fatalf("ExecuteConfirmed: %v", err)
 	}
-	if !errors.Is(err, ErrExecutionContractBlocked) {
-		t.Fatalf("expected ErrExecutionContractBlocked, got %v", err)
+	if len(runner.lastRun.Steps) != 1 {
+		t.Fatalf("expected 1 commit step, got %d", len(runner.lastRun.Steps))
+	}
+	step := runner.lastRun.Steps[0]
+	if step.Config.Method != "POST" || step.Capability != "availability.commit" {
+		t.Fatalf("unexpected availability step: %#v", step)
+	}
+	if step.Config.URL != "https://bookably.test/api/v1/specialist/schedule/commit" {
+		t.Fatalf("unexpected commit URL: %q", step.Config.URL)
+	}
+	body, ok := step.Config.Body.(acp.CommitScheduleBody)
+	if !ok {
+		t.Fatalf("expected CommitScheduleBody, got %T", step.Config.Body)
+	}
+	if len(body.Create) != 1 || len(body.Delete) != 1 {
+		t.Fatalf("unexpected availability body: %#v", body)
 	}
 }
 

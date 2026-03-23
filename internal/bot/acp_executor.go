@@ -83,7 +83,7 @@ func (e *RuntimeACPExecutor) ExecuteConfirmed(ctx context.Context, s *session.Se
 		RawMessage:   strings.TrimSpace(pending.Plan.RawUserMessage),
 	}
 
-	run, err := e.buildRun(accessToken, pending, meta)
+	run, err := e.buildRun(accessToken, pending, meta, s.Timezone)
 	if err != nil {
 		errType := "ErrValidation"
 		if errors.Is(err, ErrExecutionContractBlocked) {
@@ -159,7 +159,7 @@ func classifyExecutionErrorType(err error) string {
 	}
 }
 
-func (e *RuntimeACPExecutor) buildRun(accessToken string, pending *session.PendingPlan, meta acp.RunMetadata) (*acp.ACPRun, error) {
+func (e *RuntimeACPExecutor) buildRun(accessToken string, pending *session.PendingPlan, meta acp.RunMetadata, timezone string) (*acp.ACPRun, error) {
 	switch pending.Plan.Intent {
 	case interpreter.IntentCancelBooking:
 		bookingID := strings.TrimSpace(pending.Plan.Params.BookingID)
@@ -173,10 +173,63 @@ func (e *RuntimeACPExecutor) buildRun(accessToken string, pending *session.Pendi
 			errors.New("bot acp executor: create_booking execution is blocked until backend exposes specialist-initiated create-booking contract for named clients"),
 		)
 	case interpreter.IntentSetWorkingHours, interpreter.IntentAddBreak, interpreter.IntentCloseRange:
-		return nil, errors.Join(ErrExecutionContractBlocked, errors.New("bot acp executor: availability execution is blocked pending migration to specialist schedule commit operation-groups"))
+		create, deleteIDs, err := buildAvailabilityCommitPayload(pending, timezone)
+		if err != nil {
+			return nil, err
+		}
+		return acp.BuildAvailabilityRun(e.bookablyBaseURL, accessToken, create, deleteIDs, pending.IdempotencyKey, meta)
 	default:
 		return nil, errors.Join(domain.ErrValidation, fmt.Errorf("bot acp executor: unsupported intent %q", pending.Plan.Intent))
 	}
+}
+
+func buildAvailabilityCommitPayload(pending *session.PendingPlan, tzName string) ([]acp.CommitCreateItem, []string, error) {
+	if pending == nil || pending.Availability == nil {
+		return nil, nil, errors.Join(domain.ErrValidation, errors.New("bot acp executor: pending availability payload is missing"))
+	}
+	if strings.TrimSpace(tzName) == "" {
+		tzName = "UTC"
+	}
+	loc, err := time.LoadLocation(strings.TrimSpace(tzName))
+	if err != nil {
+		return nil, nil, errors.Join(domain.ErrValidation, fmt.Errorf("bot acp executor: invalid timezone %q", tzName))
+	}
+
+	create := make([]acp.CommitCreateItem, 0, len(pending.Availability.Create))
+	for idx, item := range pending.Availability.Create {
+		start, startErr := time.Parse(time.RFC3339, strings.TrimSpace(item.StartAt))
+		if startErr != nil {
+			return nil, nil, errors.Join(domain.ErrValidation, fmt.Errorf("bot acp executor: invalid availability create start at index %d", idx))
+		}
+		end, endErr := time.Parse(time.RFC3339, strings.TrimSpace(item.EndAt))
+		if endErr != nil {
+			return nil, nil, errors.Join(domain.ErrValidation, fmt.Errorf("bot acp executor: invalid availability create end at index %d", idx))
+		}
+		if !end.After(start) {
+			return nil, nil, errors.Join(domain.ErrValidation, fmt.Errorf("bot acp executor: availability create item %d has non-positive duration", idx))
+		}
+
+		localStart := start.In(loc)
+		localEnd := end.In(loc)
+		create = append(create, acp.CommitCreateItem{
+			Date:      localStart.Format("2006-01-02"),
+			StartTime: localStart.Format("15:04"),
+			EndTime:   localEnd.Format("15:04"),
+		})
+	}
+
+	deleteIDs := make([]string, 0, len(pending.Availability.DeleteSlotIDs))
+	for _, raw := range pending.Availability.DeleteSlotIDs {
+		id := strings.TrimSpace(raw)
+		if id == "" {
+			continue
+		}
+		deleteIDs = append(deleteIDs, id)
+	}
+	if len(create) == 0 && len(deleteIDs) == 0 {
+		return nil, nil, errors.Join(domain.ErrValidation, errors.New("bot acp executor: availability payload contains no operations"))
+	}
+	return create, deleteIDs, nil
 }
 
 func riskFromIntent(intent interpreter.Intent) string {

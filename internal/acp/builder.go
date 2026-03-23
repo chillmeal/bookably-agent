@@ -4,12 +4,22 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-
-	"github.com/chillmeal/bookably-agent/internal/domain"
 )
 
-// Availability write builder remains a provisional path and is currently not used at runtime:
-// bot executor blocks availability execution until commit-operation migration is implemented.
+type CommitCreateItem struct {
+	Date      string `json:"date"`
+	StartTime string `json:"startTime"`
+	EndTime   string `json:"endTime"`
+}
+
+type CommitDeleteItem struct {
+	SlotID string `json:"slotId"`
+}
+
+type CommitScheduleBody struct {
+	Create []CommitCreateItem `json:"create,omitempty"`
+	Delete []CommitDeleteItem `json:"delete,omitempty"`
+}
 
 func BuildCancelBookingRun(baseURL, accessToken, bookingID, idempotencyKey string, meta RunMetadata) (*ACPRun, error) {
 	if strings.TrimSpace(bookingID) == "" {
@@ -72,52 +82,57 @@ func BuildCreateBookingRun(baseURL, accessToken, serviceID, slotID, idempotencyK
 	return run, nil
 }
 
-func BuildAvailabilityRun(baseURL, accessToken string, slots []domain.Slot, baseIdempotencyKey string, meta RunMetadata) (*ACPRun, error) {
+func BuildAvailabilityRun(baseURL, accessToken string, create []CommitCreateItem, deleteSlotIDs []string, baseIdempotencyKey string, meta RunMetadata) (*ACPRun, error) {
 	if strings.TrimSpace(baseIdempotencyKey) == "" {
 		return nil, errors.New("acp builder: idempotency key is required")
 	}
-
-	trimmedBaseURL := strings.TrimRight(baseURL, "/")
-	steps := make([]ACPStep, 0, len(slots)+1)
-
-	for idx, slot := range slots {
-		if strings.TrimSpace(slot.ID) == "" {
-			return nil, fmt.Errorf("acp builder: slot index %d has empty id", idx)
-		}
-
-		key := fmt.Sprintf("%s:del:%d", strings.TrimSpace(baseIdempotencyKey), idx)
-		steps = append(steps, ACPStep{
-			Type:       "http",
-			Capability: "availability.delete_slot",
-			Config: ACPStepConfig{
-				Method: "DELETE",
-				URL:    fmt.Sprintf("%s/api/v1/specialist/slots/%s", trimmedBaseURL, strings.TrimSpace(slot.ID)),
-				Headers: map[string]string{
-					"Authorization":   bearer(accessToken),
-					"Idempotency-Key": key,
-				},
-			},
-		})
+	if len(create) == 0 && len(deleteSlotIDs) == 0 {
+		return nil, errors.New("acp builder: at least one availability operation is required")
 	}
 
-	commitKey := fmt.Sprintf("%s:commit", strings.TrimSpace(baseIdempotencyKey))
-	steps = append(steps, ACPStep{
-		Type:       "http",
-		Capability: "availability.commit",
-		Config: ACPStepConfig{
-			Method: "POST",
-			URL:    trimmedBaseURL + "/api/v1/specialist/schedule/commit",
-			Headers: map[string]string{
-				"Authorization":   bearer(accessToken),
-				"Idempotency-Key": commitKey,
-			},
-		},
-	})
+	trimmedBaseURL := strings.TrimRight(baseURL, "/")
+	body := CommitScheduleBody{
+		Create: make([]CommitCreateItem, 0, len(create)),
+		Delete: make([]CommitDeleteItem, 0, len(deleteSlotIDs)),
+	}
+	for idx, item := range create {
+		if strings.TrimSpace(item.Date) == "" {
+			return nil, fmt.Errorf("acp builder: create item %d has empty date", idx)
+		}
+		if strings.TrimSpace(item.StartTime) == "" || strings.TrimSpace(item.EndTime) == "" {
+			return nil, fmt.Errorf("acp builder: create item %d has empty time bounds", idx)
+		}
+		body.Create = append(body.Create, CommitCreateItem{
+			Date:      strings.TrimSpace(item.Date),
+			StartTime: strings.TrimSpace(item.StartTime),
+			EndTime:   strings.TrimSpace(item.EndTime),
+		})
+	}
+	for idx, slotID := range deleteSlotIDs {
+		slotID = strings.TrimSpace(slotID)
+		if slotID == "" {
+			return nil, fmt.Errorf("acp builder: delete slot id %d is empty", idx)
+		}
+		body.Delete = append(body.Delete, CommitDeleteItem{SlotID: slotID})
+	}
 
 	return &ACPRun{
 		IdempotencyKey: strings.TrimSpace(baseIdempotencyKey),
 		Metadata:       buildMetadata(meta),
-		Steps:          steps,
+		Steps: []ACPStep{{
+			Type:       "http",
+			Capability: "availability.commit",
+			Config: ACPStepConfig{
+				Method: "POST",
+				URL:    trimmedBaseURL + "/api/v1/specialist/schedule/commit",
+				Headers: map[string]string{
+					"Authorization":   bearer(accessToken),
+					"Content-Type":    "application/json",
+					"Idempotency-Key": fmt.Sprintf("%s:commit", strings.TrimSpace(baseIdempotencyKey)),
+				},
+				Body: body,
+			},
+		}},
 	}, nil
 }
 
