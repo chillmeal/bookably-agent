@@ -18,6 +18,8 @@ type PendingPlan struct {
 	PreviewMsgID   int64                  `json:"preview_msg_id"`
 	CreatedAt      time.Time              `json:"created_at"`
 	IdempotencyKey string                 `json:"idempotency_key"`
+	SlotCandidates []PendingSlotCandidate `json:"slot_candidates,omitempty"`
+	Availability   *PendingAvailability   `json:"availability,omitempty"`
 }
 
 type Session struct {
@@ -28,4 +30,21 @@ type Session struct {
 	PendingPlan        *PendingPlan `json:"pending_plan,omitempty"`
 	DialogHistory      []Message    `json:"dialog_history"`
 	UpdatedAt          time.Time    `json:"updated_at"`
+}
+
+type PendingSlotCandidate struct {
+	ID        string `json:"id"`
+	ServiceID string `json:"service_id,omitempty"`
+	StartAt   string `json:"start_at"`
+	EndAt     string `json:"end_at"`
+}
+
+type PendingAvailability struct {
+	Create        []PendingAvailabilityCreate `json:"create,omitempty"`
+	DeleteSlotIDs []string                    `json:"delete_slot_ids,omitempty"`
+}
+
+type PendingAvailabilityCreate struct {
+	StartAt string `json:"start_at"`
+	EndAt   string `json:"end_at"`
 }

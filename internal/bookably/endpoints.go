@@ -8,6 +8,7 @@ const (
 	endpointSpecialistBookings   = "/api/v1/specialist/bookings"
 	endpointPublicSlots          = "/api/v1/public/slots"
 	endpointPublicServices       = "/api/v1/public/services"
+	endpointPublicSpecialistProfile = "/api/v1/public/specialist/profile"
 	endpointSpecialistSlots      = "/api/v1/specialist/slots"
 	endpointSpecialistCommit     = "/api/v1/specialist/schedule/commit"
 	endpointPublicBookings       = "/api/v1/public/bookings"

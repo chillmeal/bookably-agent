@@ -50,6 +50,7 @@ go build ./...
 | `ACP_BASE_URL` | Yes | - | ACP API base URL |
 | `ACP_API_KEY` | Yes | - | ACP API key |
 | `BOOKABLY_API_URL` | Yes | - | Bookably API base URL |
+| `BOOKABLY_SPECIALIST_ID` | Yes | - | Single-provider specialist ID for bot runtime |
 | `LLM_PROVIDER` | Yes | - | `anthropic` or `openai` |
 | `LLM_API_KEY` | Yes | - | LLM provider API key |
 | `LLM_MODEL` | No | provider default | Optional model override |
@@ -62,17 +63,3 @@ go build ./...
 | `ACP_POLL_INTERVAL` | No | `2s` | ACP polling interval |
 | `ACP_POLL_TIMEOUT` | No | `30s` | ACP poll timeout |
 | `BOOKABLY_HTTP_TIMEOUT` | No | `5s` | Bookably HTTP timeout |
-
-## Documentation
-
-Read docs before coding:
-
-- `docs/CODEX_WORKFLOW.md`
-- `docs/01-vision-mvp-scope.md`
-- `docs/02-use-cases.md`
-- `docs/03-requirements.md`
-- `docs/04-architecture.md`
-- `docs/05-api-contract.md`
-- `docs/06-implementation-guide.md`
-- `docs/07-backlog.md`
-- `docs/ENGINEERING_PLAN.md`

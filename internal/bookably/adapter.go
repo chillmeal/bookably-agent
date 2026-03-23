@@ -100,8 +100,14 @@ type meResponse struct {
 	Actor struct {
 		SpecialistID string `json:"specialistId"`
 		Role         string `json:"role"`
-		Timezone     string `json:"timezone"`
 	} `json:"actor"`
+}
+
+type specialistProfileResponse struct {
+	Specialist *struct {
+		ID       string `json:"id"`
+		Timezone string `json:"timezone"`
+	} `json:"specialist"`
 }
 
 type prefsCachePayload struct {
@@ -237,15 +243,18 @@ func (a *Adapter) GetProviderInfo(ctx context.Context, providerID string) (*doma
 	if strings.TrimSpace(me.Actor.SpecialistID) != "" {
 		resolvedProviderID = me.Actor.SpecialistID
 	}
+	if strings.TrimSpace(resolvedProviderID) == "" {
+		return nil, errors.Join(domain.ErrValidation, errors.New("bookably adapter: specialist id is required"))
+	}
 
 	services, err := a.listServices(ctx, resolvedProviderID)
 	if err != nil {
 		return nil, err
 	}
 
-	timezone := strings.TrimSpace(me.Actor.Timezone)
-	if timezone == "" {
-		timezone = "UTC"
+	timezone, err := a.fetchSpecialistTimezone(ctx, resolvedProviderID)
+	if err != nil {
+		return nil, err
 	}
 	return &domain.ProviderInfo{ProviderID: resolvedProviderID, Timezone: timezone, Services: services}, nil
 }
@@ -274,6 +283,8 @@ func (a *Adapter) PreviewAvailabilityChange(ctx context.Context, providerID stri
 	removedWindows := make([]timeWindow, 0)
 	addedSlots := 0
 	removedSlots := 0
+	createSlots := make([]domain.Slot, 0)
+	deleteSlotIDs := make([]string, 0)
 
 	switch {
 	case p.WorkingHours != nil:
@@ -295,11 +306,15 @@ func (a *Adapter) PreviewAvailabilityChange(ctx context.Context, providerID stri
 			if _, ok := targetMap[key]; !ok {
 				removedSlots++
 				removedWindows = append(removedWindows, timeWindow{From: s.Start, To: s.End})
+				if strings.TrimSpace(s.ID) != "" {
+					deleteSlotIDs = append(deleteSlotIDs, strings.TrimSpace(s.ID))
+				}
 			}
 		}
-		for key := range targetMap {
+		for key, s := range targetMap {
 			if _, ok := existingMap[key]; !ok {
 				addedSlots++
+				createSlots = append(createSlots, domain.Slot{Start: s.Start, End: s.End})
 			}
 		}
 
@@ -312,6 +327,9 @@ func (a *Adapter) PreviewAvailabilityChange(ctx context.Context, providerID stri
 			if overlapsAny(s.Start, s.End, windows) {
 				removedSlots++
 				removedWindows = append(removedWindows, timeWindow{From: s.Start, To: s.End})
+				if strings.TrimSpace(s.ID) != "" {
+					deleteSlotIDs = append(deleteSlotIDs, strings.TrimSpace(s.ID))
+				}
 			}
 		}
 
@@ -324,6 +342,9 @@ func (a *Adapter) PreviewAvailabilityChange(ctx context.Context, providerID stri
 			if overlapsAny(s.Start, s.End, windows) {
 				removedSlots++
 				removedWindows = append(removedWindows, timeWindow{From: s.Start, To: s.End})
+				if strings.TrimSpace(s.ID) != "" {
+					deleteSlotIDs = append(deleteSlotIDs, strings.TrimSpace(s.ID))
+				}
 			}
 		}
 	}
@@ -331,14 +352,25 @@ func (a *Adapter) PreviewAvailabilityChange(ctx context.Context, providerID stri
 	conflicts := findConflicts(bookings, removedWindows)
 	risk := determineRisk(addedSlots, removedSlots, len(conflicts))
 
+	sort.Slice(createSlots, func(i, j int) bool { return createSlots[i].Start.Before(createSlots[j].Start) })
+	sort.Strings(deleteSlotIDs)
+	var availabilityExec *domain.AvailabilityExecutionPayload
+	if len(createSlots) > 0 || len(deleteSlotIDs) > 0 {
+		availabilityExec = &domain.AvailabilityExecutionPayload{
+			CreateSlots:   createSlots,
+			DeleteSlotIDs: deleteSlotIDs,
+		}
+	}
+
 	return &domain.Preview{
 		Summary: fmt.Sprintf("Preview availability impact: +%d slots, -%d slots", addedSlots, removedSlots),
 		AvailabilityChange: domain.AvailabilityChange{
 			AddedSlots:   addedSlots,
 			RemovedSlots: removedSlots,
 		},
-		Conflicts: conflicts,
-		RiskLevel: risk,
+		AvailabilityExec: availabilityExec,
+		Conflicts:        conflicts,
+		RiskLevel:        risk,
 	}, nil
 }
 
@@ -539,13 +571,8 @@ func (a *Adapter) listSpecialistSlots(ctx context.Context, from, to time.Time) (
 	query.Set("to", to.UTC().Format(time.RFC3339))
 
 	var out slotsResponse
-	err := a.client.GetJSON(ctx, endpointSpecialistSlots, query, &out)
-	if err != nil {
-		// Range query parameters are not confirmed in Doc 05 section 7. Fallback to full fetch.
-		out = slotsResponse{}
-		if fallbackErr := a.client.GetJSON(ctx, endpointSpecialistSlots, nil, &out); fallbackErr != nil {
-			return nil, err
-		}
+	if err := a.client.GetJSON(ctx, endpointSpecialistSlots, query, &out); err != nil {
+		return nil, err
 	}
 
 	slots := make([]domain.Slot, 0, len(out.Slots))
@@ -563,6 +590,24 @@ func (a *Adapter) listSpecialistSlots(ctx context.Context, from, to time.Time) (
 		}
 	}
 	return slots, nil
+}
+
+func (a *Adapter) fetchSpecialistTimezone(ctx context.Context, specialistID string) (string, error) {
+	q := url.Values{}
+	q.Set("specialistId", strings.TrimSpace(specialistID))
+
+	var out specialistProfileResponse
+	if err := a.client.GetJSON(ctx, endpointPublicSpecialistProfile, q, &out); err != nil {
+		return "", err
+	}
+	if out.Specialist == nil {
+		return "", errors.Join(domain.ErrNotFound, fmt.Errorf("bookably adapter: specialist profile %q not found", specialistID))
+	}
+	timezone := strings.TrimSpace(out.Specialist.Timezone)
+	if timezone == "" {
+		return "", errors.Join(domain.ErrValidation, fmt.Errorf("bookably adapter: specialist profile %q has empty timezone", specialistID))
+	}
+	return timezone, nil
 }
 
 func mapBookings(in []apiBooking) ([]domain.Booking, error) {

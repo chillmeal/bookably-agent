@@ -240,6 +240,15 @@ func TestPreviewAvailabilityChange_NoWriteCallsAndConflict(t *testing.T) {
 	if preview.RiskLevel != domain.RiskHigh {
 		t.Fatalf("expected high risk, got %s", preview.RiskLevel)
 	}
+	if preview.AvailabilityExec == nil {
+		t.Fatal("expected availability execution payload")
+	}
+	if len(preview.AvailabilityExec.DeleteSlotIDs) != 1 || preview.AvailabilityExec.DeleteSlotIDs[0] != "sl2" {
+		t.Fatalf("unexpected delete operations: %+v", preview.AvailabilityExec.DeleteSlotIDs)
+	}
+	if len(preview.AvailabilityExec.CreateSlots) != 0 {
+		t.Fatalf("expected no create operations, got %+v", preview.AvailabilityExec.CreateSlots)
+	}
 	if atomic.LoadInt32(&writeCalls) != 0 {
 		t.Fatalf("expected no write calls in preview, got %d", writeCalls)
 	}
@@ -372,6 +381,9 @@ func TestPreviewAvailabilityChangeEmptyRange(t *testing.T) {
 	if preview.AvailabilityChange.AddedSlots != 0 || preview.AvailabilityChange.RemovedSlots != 0 || len(preview.Conflicts) != 0 {
 		t.Fatalf("expected zero impact preview, got %+v", preview)
 	}
+	if preview.AvailabilityExec != nil {
+		t.Fatalf("expected nil availability execution payload, got %+v", preview.AvailabilityExec)
+	}
 }
 
 func TestBuildWorkingHoursSlots_InvalidBreakReturnsValidation(t *testing.T) {
@@ -411,5 +423,61 @@ func TestGetProviderInfo_ReturnsMeError(t *testing.T) {
 	}
 	if !errors.Is(err, domain.ErrUpstream) {
 		t.Fatalf("expected ErrUpstream from /me failure, got %v", err)
+	}
+}
+
+func TestGetProviderInfo_UsesSpecialistProfileTimezone(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case endpointMe:
+			_, _ = io.WriteString(w, `{"actor":{"specialistId":"spec-1","role":"SPECIALIST"}}`)
+		case endpointPublicSpecialistProfile:
+			if r.URL.Query().Get("specialistId") != "spec-1" {
+				t.Fatalf("unexpected specialistId query: %q", r.URL.Query().Get("specialistId"))
+			}
+			_, _ = io.WriteString(w, `{"specialist":{"id":"spec-1","timezone":"Europe/Moscow"}}`)
+		case endpointPublicServices:
+			_, _ = io.WriteString(w, `{"services":[{"id":"svc1","title":"Массаж","durationMin":60,"isActive":true}]}`)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	adapter := newTestAdapter(t, server.URL, nil)
+	info, err := adapter.GetProviderInfo(context.Background(), "spec-1")
+	if err != nil {
+		t.Fatalf("GetProviderInfo: %v", err)
+	}
+	if info.Timezone != "Europe/Moscow" {
+		t.Fatalf("expected Europe/Moscow timezone, got %q", info.Timezone)
+	}
+	if info.ProviderID != "spec-1" {
+		t.Fatalf("unexpected provider id: %q", info.ProviderID)
+	}
+}
+
+func TestGetProviderInfo_EmptyTimezoneReturnsValidation(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case endpointMe:
+			_, _ = io.WriteString(w, `{"actor":{"specialistId":"spec-1","role":"SPECIALIST"}}`)
+		case endpointPublicSpecialistProfile:
+			_, _ = io.WriteString(w, `{"specialist":{"id":"spec-1","timezone":""}}`)
+		case endpointPublicServices:
+			_, _ = io.WriteString(w, `{"services":[{"id":"svc1","title":"Массаж","durationMin":60,"isActive":true}]}`)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	adapter := newTestAdapter(t, server.URL, nil)
+	_, err := adapter.GetProviderInfo(context.Background(), "spec-1")
+	if err == nil {
+		t.Fatal("expected validation error when timezone is empty")
+	}
+	if !errors.Is(err, domain.ErrValidation) {
+		t.Fatalf("expected ErrValidation, got %v", err)
 	}
 }

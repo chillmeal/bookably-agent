@@ -156,6 +156,12 @@ func (m *tokenProviderMock) GetAccessToken(ctx context.Context, specialistID str
 	return m.token, nil
 }
 
+type noopSpecialistTokenStore struct{}
+
+func (noopSpecialistTokenStore) SaveToken(ctx context.Context, specialistID string, token bot.AuthToken) error {
+	return nil
+}
+
 type telegramMessageCall struct {
 	ChatID   int64
 	Text     string
@@ -325,11 +331,12 @@ func sendWebhook(t *testing.T, handler *bot.Handler, body []byte) *httptest.Resp
 func buildHandler(t *testing.T, store session.SessionStore, interp bot.InterpreterService, provider domain.Provider, executor bot.ACPExecutor, tg bot.TelegramGateway) *bot.Handler {
 	t.Helper()
 	h, err := bot.NewHandler(bot.HandlerConfig{
-		WebhookSecret: "secret",
-		WebhookURL:    "https://example.test/webhook",
-		MiniAppURL:    "https://mini.app/open",
-		PlanTTL:       15 * time.Minute,
-	}, store, interp, provider, executor, tg)
+		WebhookSecret:     "secret",
+		WebhookURL:        "https://example.test/webhook",
+		MiniAppURL:        "https://mini.app/open",
+		DefaultProviderID: "spec-1",
+		PlanTTL:           15 * time.Minute,
+	}, store, interp, provider, executor, noopSpecialistTokenStore{}, tg)
 	if err != nil {
 		t.Fatalf("NewHandler: %v", err)
 	}
@@ -418,7 +425,7 @@ func TestP702WriteCancelHappyPathIntegration(t *testing.T) {
 
 	seedSession(t, store, &session.Session{
 		ChatID:        1002,
-		ProviderID:    "spec-2",
+		ProviderID:    "spec-1",
 		Timezone:      "Europe/Moscow",
 		DialogHistory: []session.Message{},
 	})
@@ -510,7 +517,7 @@ func TestP703SessionRecoveryAfterRestartIntegration(t *testing.T) {
 
 	seedSession(t, store, &session.Session{
 		ChatID:        1003,
-		ProviderID:    "spec-3",
+		ProviderID:    "spec-1",
 		Timezone:      "Europe/Moscow",
 		DialogHistory: []session.Message{},
 	})
@@ -581,7 +588,7 @@ func TestP704ClarificationLoopEscalatesDeepLinkIntegration(t *testing.T) {
 
 	seedSession(t, store, &session.Session{
 		ChatID:        1004,
-		ProviderID:    "spec-4",
+		ProviderID:    "spec-1",
 		Timezone:      "Europe/Moscow",
 		DialogHistory: []session.Message{},
 	})
@@ -651,7 +658,7 @@ func TestP705TransientFailureAndRetryIntegration(t *testing.T) {
 
 	seedSession(t, store, &session.Session{
 		ChatID:        1005,
-		ProviderID:    "spec-5",
+		ProviderID:    "spec-1",
 		Timezone:      "Europe/Moscow",
 		DialogHistory: []session.Message{},
 	})
@@ -750,7 +757,7 @@ func TestP706ErrorPathIntegration(t *testing.T) {
 
 		seedSession(t, store, &session.Session{
 			ChatID:        1101,
-			ProviderID:    "spec-err-1",
+			ProviderID:    "spec-1",
 			Timezone:      "Europe/Moscow",
 			DialogHistory: []session.Message{},
 		})
@@ -779,7 +786,7 @@ func TestP706ErrorPathIntegration(t *testing.T) {
 		defer cleanup()
 		seedSession(t, store, &session.Session{
 			ChatID:        1102,
-			ProviderID:    "spec-err-2",
+			ProviderID:    "spec-1",
 			Timezone:      "Europe/Moscow",
 			DialogHistory: []session.Message{},
 		})
@@ -838,7 +845,7 @@ func TestP706ErrorPathIntegration(t *testing.T) {
 
 			seedSession(t, store, &session.Session{
 				ChatID:        1103,
-				ProviderID:    "spec-err-3",
+				ProviderID:    "spec-1",
 				Timezone:      "Europe/Moscow",
 				DialogHistory: []session.Message{},
 			})
@@ -925,7 +932,7 @@ func TestP706ErrorPathIntegration(t *testing.T) {
 
 		seedSession(t, store, &session.Session{
 			ChatID:     1104,
-			ProviderID: "spec-err-4",
+			ProviderID: "spec-1",
 			Timezone:   "UTC",
 			PendingPlan: &session.PendingPlan{
 				ID:           "plan-expired",
@@ -963,7 +970,7 @@ func TestP706ErrorPathIntegration(t *testing.T) {
 
 		seedSession(t, store, &session.Session{
 			ChatID:        1105,
-			ProviderID:    "spec-err-5",
+			ProviderID:    "spec-1",
 			Timezone:      "UTC",
 			DialogHistory: []session.Message{},
 		})

@@ -30,10 +30,11 @@ var (
 )
 
 type HandlerConfig struct {
-	WebhookSecret string
-	WebhookURL    string
-	MiniAppURL    string
-	PlanTTL       time.Duration
+	WebhookSecret     string
+	WebhookURL        string
+	MiniAppURL        string
+	DefaultProviderID string
+	PlanTTL           time.Duration
 }
 
 type TelegramGateway interface {
@@ -58,18 +59,29 @@ type ACPExecutor interface {
 	ExecuteConfirmed(ctx context.Context, s *session.Session, pending *session.PendingPlan) (*ExecutionResult, error)
 }
 
+type AuthToken struct {
+	AccessToken  string
+	RefreshToken string
+}
+
+type SpecialistTokenStore interface {
+	SaveToken(ctx context.Context, specialistID string, token AuthToken) error
+}
+
 type Handler struct {
 	store       session.SessionStore
 	interpreter InterpreterService
 	provider    domain.Provider
 	executor    ACPExecutor
+	tokenStore  SpecialistTokenStore
 	telegram    TelegramGateway
 	logger      *observability.Logger
 
-	webhookSecret string
-	webhookURL    string
-	miniAppURL    string
-	planTTL       time.Duration
+	webhookSecret     string
+	webhookURL        string
+	miniAppURL        string
+	defaultProviderID string
+	planTTL           time.Duration
 
 	clock func() time.Time
 
@@ -83,11 +95,17 @@ type webhookUpdate struct {
 }
 
 type telegramMessageUpdate struct {
-	MessageID int64        `json:"message_id"`
-	Chat      telegramChat `json:"chat"`
-	From      telegramFrom `json:"from"`
-	Text      string       `json:"text"`
-	Date      int64        `json:"date"`
+	MessageID  int64               `json:"message_id"`
+	Chat       telegramChat        `json:"chat"`
+	From       telegramFrom        `json:"from"`
+	Text       string              `json:"text"`
+	Date       int64               `json:"date"`
+	WebAppData *telegramWebAppData `json:"web_app_data,omitempty"`
+}
+
+type telegramWebAppData struct {
+	Data       string `json:"data"`
+	ButtonText string `json:"button_text"`
 }
 
 type telegramCallbackQueryUpdate struct {
@@ -110,7 +128,7 @@ type telegramFrom struct {
 	ID int64 `json:"id"`
 }
 
-func NewHandler(cfg HandlerConfig, store session.SessionStore, interp InterpreterService, provider domain.Provider, executor ACPExecutor, tg TelegramGateway) (*Handler, error) {
+func NewHandler(cfg HandlerConfig, store session.SessionStore, interp InterpreterService, provider domain.Provider, executor ACPExecutor, tokenStore SpecialistTokenStore, tg TelegramGateway) (*Handler, error) {
 	if store == nil {
 		return nil, errors.New("bot handler: session store is nil")
 	}
@@ -126,29 +144,37 @@ func NewHandler(cfg HandlerConfig, store session.SessionStore, interp Interprete
 	if tg == nil {
 		return nil, errors.New("bot handler: telegram gateway is nil")
 	}
+	if tokenStore == nil {
+		return nil, errors.New("bot handler: token store is nil")
+	}
 	if strings.TrimSpace(cfg.WebhookSecret) == "" {
 		return nil, errors.New("bot handler: webhook secret is required")
 	}
 	if strings.TrimSpace(cfg.MiniAppURL) == "" {
 		return nil, errors.New("bot handler: mini app URL is required")
 	}
+	if strings.TrimSpace(cfg.DefaultProviderID) == "" {
+		return nil, errors.New("bot handler: default provider id is required")
+	}
 	if cfg.PlanTTL <= 0 {
 		cfg.PlanTTL = 15 * time.Minute
 	}
 
 	return &Handler{
-		store:         store,
-		interpreter:   interp,
-		provider:      provider,
-		executor:      executor,
-		telegram:      tg,
-		logger:        observability.NewLogger(nil),
-		webhookSecret: strings.TrimSpace(cfg.WebhookSecret),
-		webhookURL:    strings.TrimSpace(cfg.WebhookURL),
-		miniAppURL:    strings.TrimSpace(cfg.MiniAppURL),
-		planTTL:       cfg.PlanTTL,
-		clock:         func() time.Time { return time.Now().UTC() },
-		chatLocks:     make(map[int64]*sync.Mutex),
+		store:             store,
+		interpreter:       interp,
+		provider:          provider,
+		executor:          executor,
+		tokenStore:        tokenStore,
+		telegram:          tg,
+		logger:            observability.NewLogger(nil),
+		webhookSecret:     strings.TrimSpace(cfg.WebhookSecret),
+		webhookURL:        strings.TrimSpace(cfg.WebhookURL),
+		miniAppURL:        strings.TrimSpace(cfg.MiniAppURL),
+		defaultProviderID: strings.TrimSpace(cfg.DefaultProviderID),
+		planTTL:           cfg.PlanTTL,
+		clock:             func() time.Time { return time.Now().UTC() },
+		chatLocks:         make(map[int64]*sync.Mutex),
 	}, nil
 }
 
@@ -258,16 +284,34 @@ func (h *Handler) handleMessage(ctx context.Context, msg *telegramMessageUpdate)
 	}
 
 	chatID := msg.Chat.ID
-	if err := h.telegram.SendChatAction(ctx, chatID, "typing"); err != nil {
-		return err
-	}
-
 	s, err := LoadOrCreate(ctx, h.store, chatID)
 	if err != nil {
 		return err
 	}
+
+	if msg.WebAppData != nil {
+		return h.handleWebAppData(ctx, s, msg)
+	}
+
+	if strings.TrimSpace(s.ProviderID) == "" {
+		return h.sendLoginButton(ctx, chatID)
+	}
+	if strings.TrimSpace(s.ProviderID) != h.defaultProviderID {
+		return h.sendLoginButton(ctx, chatID)
+	}
+
 	if strings.TrimSpace(s.Timezone) == "" {
-		s.Timezone = "UTC"
+		if err := h.hydrateSessionProviderInfo(ctx, s); err != nil {
+			h.logError(chatID, "", "bot/handler", time.Now(), errorKind(err), err, map[string]any{"stage": "hydrate_provider_info"})
+			if _, sendErr := h.telegram.SendText(ctx, chatID, FormatError(errorKind(err)), nil); sendErr != nil {
+				return sendErr
+			}
+			return h.store.Save(ctx, s)
+		}
+	}
+
+	if err := h.telegram.SendChatAction(ctx, chatID, "typing"); err != nil {
+		return err
 	}
 
 	if s.PendingPlan != nil {
@@ -389,7 +433,7 @@ func (h *Handler) handleFindNextSlot(ctx context.Context, s *session.Session, pl
 		location = time.UTC
 	}
 
-	pending := SetPendingPlan(s, *plan, 0, "")
+	pending := SetPendingPlan(s, *plan, 0, "", &PendingPlanOptions{SlotCandidates: slots})
 	keyboard := BuildSlotKeyboard(pending.ID, slots, location)
 	text := FormatFindSlotResult(slots, location)
 	msgID, err := h.telegram.Finalize(ctx, chatID, text, &keyboard)
@@ -433,7 +477,10 @@ func (h *Handler) handleWritePreview(ctx context.Context, s *session.Session, pl
 		return h.sendDeepLinkEscalation(ctx, s, chatID, "availability", "impact_gt_20")
 	}
 
-	pending := SetPendingPlan(s, *plan, 0, "")
+	pending := SetPendingPlan(s, *plan, 0, "", &PendingPlanOptions{
+		SlotCandidates: preview.ProposedSlots,
+		Availability:   preview.AvailabilityExec,
+	})
 	pending.IdempotencyKey = buildIdempotencyKey(chatID, pending.ID, plan.Intent)
 
 	location, _ := time.LoadLocation(s.Timezone)
@@ -543,31 +590,39 @@ func (h *Handler) handleCallback(ctx context.Context, cb *telegramCallbackQueryU
 }
 
 func (h *Handler) handleSlotSelection(ctx context.Context, s *session.Session, idx int) error {
-	req, err := buildSlotSearchRequest(s.PendingPlan.Plan.Params, h.clock())
-	if err != nil {
-		h.logError(s.ChatID, string(s.PendingPlan.Plan.Intent), "bot/handler", time.Now(), errorKind(err), err, map[string]any{"stage": "slot_select_build_search"})
-		if _, sendErr := h.telegram.SendText(ctx, s.ChatID, FormatError(errorKind(err)), nil); sendErr != nil {
-			return sendErr
-		}
+	if s == nil || s.PendingPlan == nil {
 		return nil
 	}
-
-	slots, err := h.provider.FindSlots(ctx, s.ProviderID, req)
-	if err != nil {
-		h.logError(s.ChatID, string(s.PendingPlan.Plan.Intent), "bot/handler", time.Now(), errorKind(err), err, map[string]any{"stage": "slot_select_find_slots"})
-		if _, sendErr := h.telegram.SendText(ctx, s.ChatID, FormatError(errorKind(err)), nil); sendErr != nil {
-			return sendErr
-		}
-		return nil
-	}
-	if idx < 0 || idx >= len(slots) {
+	if idx < 0 || idx >= len(s.PendingPlan.SlotCandidates) {
 		if _, sendErr := h.telegram.SendText(ctx, s.ChatID, "Выбранный слот недоступен\\.", nil); sendErr != nil {
 			return sendErr
 		}
 		return nil
 	}
 
-	selected := slots[idx]
+	candidate := s.PendingPlan.SlotCandidates[idx]
+	start, err := time.Parse(time.RFC3339, strings.TrimSpace(candidate.StartAt))
+	if err != nil {
+		h.logError(s.ChatID, string(s.PendingPlan.Plan.Intent), "bot/handler", time.Now(), "ErrValidation", err, map[string]any{"stage": "slot_select_parse_start"})
+		if _, sendErr := h.telegram.SendText(ctx, s.ChatID, "Выбранный слот недоступен\\.", nil); sendErr != nil {
+			return sendErr
+		}
+		return nil
+	}
+	end, err := time.Parse(time.RFC3339, strings.TrimSpace(candidate.EndAt))
+	if err != nil {
+		h.logError(s.ChatID, string(s.PendingPlan.Plan.Intent), "bot/handler", time.Now(), "ErrValidation", err, map[string]any{"stage": "slot_select_parse_end"})
+		if _, sendErr := h.telegram.SendText(ctx, s.ChatID, "Выбранный слот недоступен\\.", nil); sendErr != nil {
+			return sendErr
+		}
+		return nil
+	}
+	selected := domain.Slot{
+		ID:        strings.TrimSpace(candidate.ID),
+		ServiceID: strings.TrimSpace(candidate.ServiceID),
+		Start:     start.UTC(),
+		End:       end.UTC(),
+	}
 	if err := h.telegram.EditMessageReplyMarkup(ctx, s.ChatID, s.PendingPlan.PreviewMsgID, &InlineKeyboardMarkup{InlineKeyboard: [][]InlineKeyboardButton{}}); err != nil {
 		return err
 	}
@@ -765,6 +820,101 @@ func mapActionParams(p interpreter.ActionParams) domain.ActionParams {
 		}
 	}
 	return out
+}
+
+type webAppAuthPayload struct {
+	Token        string `json:"token"`
+	RefreshToken string `json:"refreshToken"`
+	SpecialistID string `json:"specialistId"`
+}
+
+func (h *Handler) handleWebAppData(ctx context.Context, s *session.Session, msg *telegramMessageUpdate) error {
+	if msg == nil || msg.WebAppData == nil {
+		return nil
+	}
+	chatID := msg.Chat.ID
+
+	var payload webAppAuthPayload
+	if err := json.Unmarshal([]byte(msg.WebAppData.Data), &payload); err != nil {
+		_, _ = h.telegram.SendText(ctx, chatID, "Не удалось войти\\. Попробуй ещё раз\\.", nil)
+		return h.sendLoginButton(ctx, chatID)
+	}
+
+	payload.Token = strings.TrimSpace(payload.Token)
+	payload.RefreshToken = strings.TrimSpace(payload.RefreshToken)
+	payload.SpecialistID = strings.TrimSpace(payload.SpecialistID)
+	if payload.Token == "" || payload.SpecialistID == "" {
+		_, _ = h.telegram.SendText(ctx, chatID, "Не удалось войти\\. Попробуй ещё раз\\.", nil)
+		return h.sendLoginButton(ctx, chatID)
+	}
+	if payload.SpecialistID != h.defaultProviderID {
+		_, _ = h.telegram.SendText(ctx, chatID, "Этот аккаунт не поддерживается в текущей конфигурации бота\\.", nil)
+		return h.sendLoginButton(ctx, chatID)
+	}
+
+	if err := h.tokenStore.SaveToken(ctx, payload.SpecialistID, AuthToken{
+		AccessToken:  payload.Token,
+		RefreshToken: payload.RefreshToken,
+	}); err != nil {
+		return err
+	}
+
+	s.ProviderID = payload.SpecialistID
+	if err := h.hydrateSessionProviderInfo(ctx, s); err != nil {
+		h.logError(chatID, "", "bot/handler", time.Now(), errorKind(err), err, map[string]any{"stage": "auth_hydrate_provider_info"})
+		if _, sendErr := h.telegram.SendText(ctx, chatID, "Вход выполнен, но профиль специалиста пока недоступен\\. Попробуй ещё раз\\.", nil); sendErr != nil {
+			return sendErr
+		}
+		return h.store.Save(ctx, s)
+	}
+
+	if err := h.store.Save(ctx, s); err != nil {
+		return err
+	}
+	_, err := h.telegram.SendText(ctx, chatID, "Вошёл\\. Теперь можешь управлять записями\\.", nil)
+	return err
+}
+
+func (h *Handler) sendLoginButton(ctx context.Context, chatID int64) error {
+	link := strings.TrimSpace(h.miniAppURL)
+	if strings.Contains(link, "?") {
+		link += "&mode=bot_auth"
+	} else {
+		link += "?mode=bot_auth"
+	}
+	keyboard := InlineKeyboardMarkup{
+		InlineKeyboard: [][]InlineKeyboardButton{
+			{NewWebAppButton("Войти в Bookably", link)},
+		},
+	}
+	_, err := h.telegram.SendText(ctx, chatID, "Чтобы начать, войди в свой аккаунт Bookably\\.", &keyboard)
+	return err
+}
+
+func (h *Handler) hydrateSessionProviderInfo(ctx context.Context, s *session.Session) error {
+	if s == nil {
+		return errors.New("bot handler: session is nil")
+	}
+	providerID := strings.TrimSpace(s.ProviderID)
+	if providerID == "" {
+		return errors.Join(domain.ErrValidation, errors.New("provider_id is required"))
+	}
+	info, err := h.provider.GetProviderInfo(ctx, providerID)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(info.ProviderID) != "" {
+		s.ProviderID = strings.TrimSpace(info.ProviderID)
+	}
+	tz := strings.TrimSpace(info.Timezone)
+	if tz == "" {
+		return errors.Join(domain.ErrValidation, errors.New("provider timezone is empty"))
+	}
+	if _, err := time.LoadLocation(tz); err != nil {
+		return errors.Join(domain.ErrValidation, fmt.Errorf("invalid provider timezone %q", tz))
+	}
+	s.Timezone = tz
+	return nil
 }
 
 func buildBookingFilter(params interpreter.ActionParams, tzName string, now time.Time) (domain.BookingFilter, error) {

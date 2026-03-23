@@ -64,13 +64,19 @@ type AvailabilityChange struct {
 	RemovedSlots int `json:"removed_slots"`
 }
 
+type AvailabilityExecutionPayload struct {
+	CreateSlots   []Slot   `json:"create_slots,omitempty"`
+	DeleteSlotIDs []string `json:"delete_slot_ids,omitempty"`
+}
+
 type Preview struct {
-	Summary            string             `json:"summary"`
-	AvailabilityChange AvailabilityChange `json:"availability_change"`
-	Conflicts          []Conflict         `json:"conflicts,omitempty"`
-	ProposedSlots      []Slot             `json:"proposed_slots,omitempty"`
-	BookingResult      *Booking           `json:"booking_result,omitempty"`
-	RiskLevel          RiskLevel          `json:"risk_level"`
+	Summary            string                        `json:"summary"`
+	AvailabilityChange AvailabilityChange            `json:"availability_change"`
+	AvailabilityExec   *AvailabilityExecutionPayload `json:"availability_exec,omitempty"`
+	Conflicts          []Conflict                    `json:"conflicts,omitempty"`
+	ProposedSlots      []Slot                        `json:"proposed_slots,omitempty"`
+	BookingResult      *Booking                      `json:"booking_result,omitempty"`
+	RiskLevel          RiskLevel                     `json:"risk_level"`
 }
 
 type BookingFilter struct {

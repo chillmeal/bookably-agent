@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/chillmeal/bookably-agent/internal/domain"
 	"github.com/chillmeal/bookably-agent/internal/interpreter"
 	"github.com/chillmeal/bookably-agent/internal/session"
 )
@@ -41,7 +42,12 @@ func LoadOrCreate(ctx context.Context, store session.SessionStore, chatID int64)
 	return s, nil
 }
 
-func SetPendingPlan(s *session.Session, plan interpreter.ActionPlan, msgID int64, idempKey string) *session.PendingPlan {
+type PendingPlanOptions struct {
+	SlotCandidates []domain.Slot
+	Availability   *domain.AvailabilityExecutionPayload
+}
+
+func SetPendingPlan(s *session.Session, plan interpreter.ActionPlan, msgID int64, idempKey string, opts *PendingPlanOptions) *session.PendingPlan {
 	if s == nil {
 		return nil
 	}
@@ -52,6 +58,15 @@ func SetPendingPlan(s *session.Session, plan interpreter.ActionPlan, msgID int64
 		PreviewMsgID:   msgID,
 		CreatedAt:      time.Now().UTC(),
 		IdempotencyKey: strings.TrimSpace(idempKey),
+	}
+
+	if opts != nil {
+		if len(opts.SlotCandidates) > 0 {
+			pending.SlotCandidates = toPendingSlotCandidates(opts.SlotCandidates)
+		}
+		if opts.Availability != nil {
+			pending.Availability = toPendingAvailability(opts.Availability)
+		}
 	}
 	s.PendingPlan = pending
 	return pending
@@ -104,8 +119,57 @@ func ReplacePendingPlan(s *session.Session, newPlan interpreter.ActionPlan, msgI
 		return false, nil
 	}
 	replaced := s.PendingPlan != nil
-	pending := SetPendingPlan(s, newPlan, msgID, idempKey)
+	pending := SetPendingPlan(s, newPlan, msgID, idempKey, nil)
 	return replaced, pending
+}
+
+func toPendingSlotCandidates(slots []domain.Slot) []session.PendingSlotCandidate {
+	out := make([]session.PendingSlotCandidate, 0, len(slots))
+	for _, slot := range slots {
+		if strings.TrimSpace(slot.ID) == "" || slot.Start.IsZero() || slot.End.IsZero() {
+			continue
+		}
+		out = append(out, session.PendingSlotCandidate{
+			ID:        strings.TrimSpace(slot.ID),
+			ServiceID: strings.TrimSpace(slot.ServiceID),
+			StartAt:   slot.Start.UTC().Format(time.RFC3339),
+			EndAt:     slot.End.UTC().Format(time.RFC3339),
+		})
+	}
+	return out
+}
+
+func toPendingAvailability(exec *domain.AvailabilityExecutionPayload) *session.PendingAvailability {
+	if exec == nil {
+		return nil
+	}
+	out := &session.PendingAvailability{
+		Create:        make([]session.PendingAvailabilityCreate, 0, len(exec.CreateSlots)),
+		DeleteSlotIDs: make([]string, 0, len(exec.DeleteSlotIDs)),
+	}
+
+	for _, slot := range exec.CreateSlots {
+		if slot.Start.IsZero() || slot.End.IsZero() {
+			continue
+		}
+		out.Create = append(out.Create, session.PendingAvailabilityCreate{
+			StartAt: slot.Start.UTC().Format(time.RFC3339),
+			EndAt:   slot.End.UTC().Format(time.RFC3339),
+		})
+	}
+
+	for _, slotID := range exec.DeleteSlotIDs {
+		slotID = strings.TrimSpace(slotID)
+		if slotID == "" {
+			continue
+		}
+		out.DeleteSlotIDs = append(out.DeleteSlotIDs, slotID)
+	}
+
+	if len(out.Create) == 0 && len(out.DeleteSlotIDs) == 0 {
+		return nil
+	}
+	return out
 }
 
 func generatePlanID() string {

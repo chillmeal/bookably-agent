@@ -23,7 +23,8 @@ type Config struct {
 	ACPAPIKey  string `envconfig:"ACP_API_KEY" required:"true"`
 
 	// Bookably
-	BookablyAPIURL string `envconfig:"BOOKABLY_API_URL" required:"true"`
+	BookablyAPIURL       string `envconfig:"BOOKABLY_API_URL" required:"true"`
+	BookablySpecialistID string `envconfig:"BOOKABLY_SPECIALIST_ID" required:"true"`
 
 	// LLM
 	LLMProvider string `envconfig:"LLM_PROVIDER" required:"true"` // anthropic | openai
@@ -54,16 +55,17 @@ func Load() (*Config, error) {
 	}
 
 	required := map[string]string{
-		"TG_BOT_TOKEN":      c.TelegramBotToken,
-		"TG_WEBHOOK_URL":    c.TelegramWebhookURL,
-		"TG_WEBHOOK_SECRET": c.TelegramWebhookSecret,
-		"REDIS_URL":         c.RedisURL,
-		"ACP_BASE_URL":      c.ACPBaseURL,
-		"ACP_API_KEY":       c.ACPAPIKey,
-		"BOOKABLY_API_URL":  c.BookablyAPIURL,
-		"LLM_PROVIDER":      c.LLMProvider,
-		"LLM_API_KEY":       c.LLMAPIKey,
-		"MINI_APP_URL":      c.MiniAppURL,
+		"TG_BOT_TOKEN":           c.TelegramBotToken,
+		"TG_WEBHOOK_URL":         c.TelegramWebhookURL,
+		"TG_WEBHOOK_SECRET":      c.TelegramWebhookSecret,
+		"REDIS_URL":              c.RedisURL,
+		"ACP_BASE_URL":           c.ACPBaseURL,
+		"ACP_API_KEY":            c.ACPAPIKey,
+		"BOOKABLY_API_URL":       c.BookablyAPIURL,
+		"BOOKABLY_SPECIALIST_ID": c.BookablySpecialistID,
+		"LLM_PROVIDER":           c.LLMProvider,
+		"LLM_API_KEY":            c.LLMAPIKey,
+		"MINI_APP_URL":           c.MiniAppURL,
 	}
 	for name, value := range required {
 		if strings.TrimSpace(value) == "" {

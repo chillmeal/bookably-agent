@@ -14,6 +14,7 @@ var allEnvKeys = []string{
 	"ACP_BASE_URL",
 	"ACP_API_KEY",
 	"BOOKABLY_API_URL",
+	"BOOKABLY_SPECIALIST_ID",
 	"LLM_PROVIDER",
 	"LLM_API_KEY",
 	"LLM_MODEL",
@@ -42,6 +43,7 @@ func setBaseEnv(t *testing.T) {
 	t.Setenv("ACP_BASE_URL", "http://localhost:8181")
 	t.Setenv("ACP_API_KEY", "acp-key")
 	t.Setenv("BOOKABLY_API_URL", "http://localhost:3000")
+	t.Setenv("BOOKABLY_SPECIALIST_ID", "spec-1")
 	t.Setenv("LLM_PROVIDER", "anthropic")
 	t.Setenv("LLM_API_KEY", "llm-key")
 	t.Setenv("LLM_MODEL", "claude-sonnet")
@@ -86,6 +88,11 @@ func TestLoadConfig_MissingRequired(t *testing.T) {
 			name:      "missing llm api key",
 			missing:   "LLM_API_KEY",
 			errorText: "LLM_API_KEY",
+		},
+		{
+			name:      "missing bookably specialist id",
+			missing:   "BOOKABLY_SPECIALIST_ID",
+			errorText: "BOOKABLY_SPECIALIST_ID",
 		},
 	}
 
@@ -133,6 +140,9 @@ func TestLoadConfig_ValidEnv(t *testing.T) {
 	}
 	if cfg.BookablyAPIURL != "http://localhost:3000" {
 		t.Fatalf("BookablyAPIURL mismatch: %q", cfg.BookablyAPIURL)
+	}
+	if cfg.BookablySpecialistID != "spec-1" {
+		t.Fatalf("BookablySpecialistID mismatch: %q", cfg.BookablySpecialistID)
 	}
 	if cfg.LLMProvider != "anthropic" {
 		t.Fatalf("LLMProvider mismatch: %q", cfg.LLMProvider)

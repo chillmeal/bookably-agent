@@ -101,18 +101,18 @@ func (m *mockInterpreter) CallCount() int {
 type mockProvider struct {
 	mu sync.Mutex
 
-	getBookingsCalls            int
-	findSlotsCalls              int
-	previewAvailabilityCalls    int
-	previewBookingCreateCalls   int
-	previewBookingCancelCalls   int
-	getProviderInfoCalls        int
-	getBookingsFn               func(ctx context.Context, providerID string, f domain.BookingFilter) ([]domain.Booking, error)
-	findSlotsFn                 func(ctx context.Context, providerID string, req domain.SlotSearchRequest) ([]domain.Slot, error)
-	previewAvailabilityFn       func(ctx context.Context, providerID string, p domain.ActionParams) (*domain.Preview, error)
-	previewBookingCreateFn      func(ctx context.Context, providerID string, p domain.ActionParams) (*domain.Preview, error)
-	previewBookingCancelFn      func(ctx context.Context, providerID string, p domain.ActionParams) (*domain.Preview, error)
-	getProviderInfoFn           func(ctx context.Context, providerID string) (*domain.ProviderInfo, error)
+	getBookingsCalls          int
+	findSlotsCalls            int
+	previewAvailabilityCalls  int
+	previewBookingCreateCalls int
+	previewBookingCancelCalls int
+	getProviderInfoCalls      int
+	getBookingsFn             func(ctx context.Context, providerID string, f domain.BookingFilter) ([]domain.Booking, error)
+	findSlotsFn               func(ctx context.Context, providerID string, req domain.SlotSearchRequest) ([]domain.Slot, error)
+	previewAvailabilityFn     func(ctx context.Context, providerID string, p domain.ActionParams) (*domain.Preview, error)
+	previewBookingCreateFn    func(ctx context.Context, providerID string, p domain.ActionParams) (*domain.Preview, error)
+	previewBookingCancelFn    func(ctx context.Context, providerID string, p domain.ActionParams) (*domain.Preview, error)
+	getProviderInfoFn         func(ctx context.Context, providerID string) (*domain.ProviderInfo, error)
 }
 
 func (m *mockProvider) GetBookings(ctx context.Context, providerID string, f domain.BookingFilter) ([]domain.Booking, error) {
@@ -214,6 +214,34 @@ func (m *mockExecutor) CallCount() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.calls
+}
+
+type mockTokenStore struct {
+	mu      sync.Mutex
+	tokens  map[string]AuthToken
+	saves   int
+	saveErr error
+}
+
+func newMockTokenStore() *mockTokenStore {
+	return &mockTokenStore{tokens: make(map[string]AuthToken)}
+}
+
+func (m *mockTokenStore) SaveToken(ctx context.Context, specialistID string, token AuthToken) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.saveErr != nil {
+		return m.saveErr
+	}
+	m.saves++
+	m.tokens[specialistID] = token
+	return nil
+}
+
+func (m *mockTokenStore) SaveCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.saves
 }
 
 type telegramMessageCall struct {
@@ -345,6 +373,10 @@ func cloneMarkup(markup *InlineKeyboardMarkup) *InlineKeyboardMarkup {
 }
 
 func newTestHandler(t *testing.T, store *inMemorySessionStore, interp *mockInterpreter, provider *mockProvider, executor *mockExecutor, tg *mockTelegramGateway) *Handler {
+	return newTestHandlerWithTokenStore(t, store, interp, provider, executor, nil, tg)
+}
+
+func newTestHandlerWithTokenStore(t *testing.T, store *inMemorySessionStore, interp *mockInterpreter, provider *mockProvider, executor *mockExecutor, tokenStore *mockTokenStore, tg *mockTelegramGateway) *Handler {
 	t.Helper()
 
 	if store == nil {
@@ -366,24 +398,41 @@ func newTestHandler(t *testing.T, store *inMemorySessionStore, interp *mockInter
 	if tg == nil {
 		tg = newMockTelegramGateway()
 	}
+	if tokenStore == nil {
+		tokenStore = newMockTokenStore()
+	}
 
 	handler, err := NewHandler(
 		HandlerConfig{
-			WebhookSecret: "secret",
-			WebhookURL:    "https://example.test/webhook",
-			MiniAppURL:    "https://mini.app/open",
-			PlanTTL:       15 * time.Minute,
+			WebhookSecret:     "secret",
+			WebhookURL:        "https://example.test/webhook",
+			MiniAppURL:        "https://mini.app/open",
+			DefaultProviderID: "prov-1",
+			PlanTTL:           15 * time.Minute,
 		},
 		store,
 		interp,
 		provider,
 		executor,
+		tokenStore,
 		tg,
 	)
 	if err != nil {
 		t.Fatalf("NewHandler: %v", err)
 	}
 	return handler
+}
+
+func seedAuthorizedSession(t *testing.T, store *inMemorySessionStore, chatID int64) {
+	t.Helper()
+	if err := store.Save(context.Background(), &session.Session{
+		ChatID:        chatID,
+		ProviderID:    "prov-1",
+		Timezone:      "UTC",
+		DialogHistory: make([]session.Message, 0, 10),
+	}); err != nil {
+		t.Fatalf("seed authorized session: %v", err)
+	}
 }
 
 func makeMessageBody(t *testing.T, chatID int64, text string) []byte {
@@ -404,6 +453,31 @@ func makeMessageBody(t *testing.T, chatID int64, text string) []byte {
 	out, err := json.Marshal(payload)
 	if err != nil {
 		t.Fatalf("marshal message body: %v", err)
+	}
+	return out
+}
+
+func makeWebAppDataBody(t *testing.T, chatID int64, payload string) []byte {
+	t.Helper()
+	raw := map[string]any{
+		"message": map[string]any{
+			"message_id": 1,
+			"date":       1,
+			"chat": map[string]any{
+				"id": chatID,
+			},
+			"from": map[string]any{
+				"id": chatID,
+			},
+			"web_app_data": map[string]any{
+				"data":        payload,
+				"button_text": "Войти в Bookably",
+			},
+		},
+	}
+	out, err := json.Marshal(raw)
+	if err != nil {
+		t.Fatalf("marshal web_app_data body: %v", err)
 	}
 	return out
 }
@@ -482,12 +556,14 @@ func TestHandlerServeHTTPRejectsWrongSecret(t *testing.T) {
 }
 
 func TestHandlerServeHTTPRoutesMessageOnce(t *testing.T) {
+	store := newInMemorySessionStore()
+	seedAuthorizedSession(t, store, 11)
 	interp := &mockInterpreter{
 		fn: func(ctx context.Context, userMessage string, convo interpreter.ConversationContext) (*interpreter.ActionPlan, error) {
 			return &interpreter.ActionPlan{Intent: interpreter.IntentUnknown, Confidence: 0.1}, nil
 		},
 	}
-	h := newTestHandler(t, nil, interp, nil, nil, nil)
+	h := newTestHandler(t, store, interp, nil, nil, nil)
 
 	rec := sendWebhook(t, h, "secret", makeMessageBody(t, 11, "Привет"))
 	if rec.Code != http.StatusOK {
@@ -499,6 +575,8 @@ func TestHandlerServeHTTPRoutesMessageOnce(t *testing.T) {
 }
 
 func TestHandlerSerializesProcessingPerChat(t *testing.T) {
+	store := newInMemorySessionStore()
+	seedAuthorizedSession(t, store, 12)
 	var inFlight int32
 	var maxInFlight int32
 
@@ -516,7 +594,7 @@ func TestHandlerSerializesProcessingPerChat(t *testing.T) {
 			return &interpreter.ActionPlan{Intent: interpreter.IntentUnknown, Confidence: 0.1}, nil
 		},
 	}
-	h := newTestHandler(t, nil, interp, nil, nil, nil)
+	h := newTestHandler(t, store, interp, nil, nil, nil)
 
 	const requests = 2
 	var wg sync.WaitGroup
@@ -549,6 +627,7 @@ func TestHandlerSerializesProcessingPerChat(t *testing.T) {
 
 func TestHandlerMessageWriteIntentBuildsPreviewAndPendingPlan(t *testing.T) {
 	store := newInMemorySessionStore()
+	seedAuthorizedSession(t, store, 13)
 	interp := &mockInterpreter{
 		fn: func(ctx context.Context, userMessage string, convo interpreter.ConversationContext) (*interpreter.ActionPlan, error) {
 			return &interpreter.ActionPlan{
@@ -617,6 +696,7 @@ func TestHandlerMessageWriteIntentBuildsPreviewAndPendingPlan(t *testing.T) {
 
 func TestHandlerMessageUnknownIntentOnboardingNoKeyboard(t *testing.T) {
 	store := newInMemorySessionStore()
+	seedAuthorizedSession(t, store, 14)
 	interp := &mockInterpreter{
 		fn: func(ctx context.Context, userMessage string, convo interpreter.ConversationContext) (*interpreter.ActionPlan, error) {
 			return &interpreter.ActionPlan{Intent: interpreter.IntentUnknown, Confidence: 0.2}, nil
@@ -650,6 +730,7 @@ func TestHandlerMessageUnknownIntentOnboardingNoKeyboard(t *testing.T) {
 
 func TestHandlerReadOnlyListBookingsCallsProviderWithoutACP(t *testing.T) {
 	store := newInMemorySessionStore()
+	seedAuthorizedSession(t, store, 15)
 	interp := &mockInterpreter{
 		fn: func(ctx context.Context, userMessage string, convo interpreter.ConversationContext) (*interpreter.ActionPlan, error) {
 			return &interpreter.ActionPlan{
@@ -695,6 +776,8 @@ func TestHandlerReadOnlyListBookingsCallsProviderWithoutACP(t *testing.T) {
 }
 
 func TestHandlerReadOnlyListBookingsLongRangeEscalatesDeepLink(t *testing.T) {
+	store := newInMemorySessionStore()
+	seedAuthorizedSession(t, store, 16)
 	interp := &mockInterpreter{
 		fn: func(ctx context.Context, userMessage string, convo interpreter.ConversationContext) (*interpreter.ActionPlan, error) {
 			return &interpreter.ActionPlan{
@@ -708,7 +791,7 @@ func TestHandlerReadOnlyListBookingsLongRangeEscalatesDeepLink(t *testing.T) {
 	}
 	provider := &mockProvider{}
 	tg := newMockTelegramGateway()
-	h := newTestHandler(t, nil, interp, provider, nil, tg)
+	h := newTestHandler(t, store, interp, provider, nil, tg)
 
 	rec := sendWebhook(t, h, "secret", makeMessageBody(t, 16, "Покажи записи за месяц"))
 	if rec.Code != http.StatusOK {
@@ -727,12 +810,121 @@ func TestHandlerReadOnlyListBookingsLongRangeEscalatesDeepLink(t *testing.T) {
 	}
 }
 
+func TestHandlerMessageUnauthenticatedShowsLoginButton(t *testing.T) {
+	store := newInMemorySessionStore()
+	interp := &mockInterpreter{
+		fn: func(ctx context.Context, userMessage string, convo interpreter.ConversationContext) (*interpreter.ActionPlan, error) {
+			return &interpreter.ActionPlan{Intent: interpreter.IntentUnknown, Confidence: 0.1}, nil
+		},
+	}
+	tg := newMockTelegramGateway()
+	h := newTestHandler(t, store, interp, nil, nil, tg)
+
+	rec := sendWebhook(t, h, "secret", makeMessageBody(t, 66, "Привет"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	if interp.CallCount() != 0 {
+		t.Fatalf("interpreter must not be called for unauthenticated message, got %d", interp.CallCount())
+	}
+	if len(tg.sendTextCalls) != 1 {
+		t.Fatalf("expected one login message, got %d", len(tg.sendTextCalls))
+	}
+	call := tg.sendTextCalls[0]
+	if call.Keyboard == nil || len(call.Keyboard.InlineKeyboard) == 0 || call.Keyboard.InlineKeyboard[0][0].WebApp == nil {
+		t.Fatalf("expected web_app login keyboard, got %#v", call.Keyboard)
+	}
+	if !strings.Contains(call.Keyboard.InlineKeyboard[0][0].WebApp.URL, "mode=bot_auth") {
+		t.Fatalf("expected bot_auth mode in login URL, got %q", call.Keyboard.InlineKeyboard[0][0].WebApp.URL)
+	}
+}
+
+func TestHandlerWebAppDataAuthSuccessSavesTokenAndSession(t *testing.T) {
+	store := newInMemorySessionStore()
+	tokenStore := newMockTokenStore()
+	provider := &mockProvider{
+		getProviderInfoFn: func(ctx context.Context, providerID string) (*domain.ProviderInfo, error) {
+			return &domain.ProviderInfo{ProviderID: "prov-1", Timezone: "Europe/Moscow"}, nil
+		},
+	}
+	tg := newMockTelegramGateway()
+	h := newTestHandlerWithTokenStore(t, store, nil, provider, nil, tokenStore, tg)
+
+	payload := `{"token":"access-1","refreshToken":"refresh-1","specialistId":"prov-1"}`
+	rec := sendWebhook(t, h, "secret", makeWebAppDataBody(t, 67, payload))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	if tokenStore.SaveCount() != 1 {
+		t.Fatalf("expected one token save, got %d", tokenStore.SaveCount())
+	}
+
+	saved, err := store.Get(context.Background(), 67)
+	if err != nil {
+		t.Fatalf("store.Get: %v", err)
+	}
+	if saved.ProviderID != "prov-1" {
+		t.Fatalf("expected provider id prov-1, got %q", saved.ProviderID)
+	}
+	if saved.Timezone != "Europe/Moscow" {
+		t.Fatalf("expected timezone Europe/Moscow, got %q", saved.Timezone)
+	}
+	if len(tg.sendTextCalls) == 0 || !strings.Contains(tg.sendTextCalls[len(tg.sendTextCalls)-1].Text, "Вошёл") {
+		t.Fatalf("expected auth success message, got %#v", tg.sendTextCalls)
+	}
+}
+
+func TestHandlerWebAppDataSpecialistMismatchShowsLogin(t *testing.T) {
+	store := newInMemorySessionStore()
+	tokenStore := newMockTokenStore()
+	tg := newMockTelegramGateway()
+	h := newTestHandlerWithTokenStore(t, store, nil, nil, nil, tokenStore, tg)
+
+	payload := `{"token":"access-1","refreshToken":"refresh-1","specialistId":"other-spec"}`
+	rec := sendWebhook(t, h, "secret", makeWebAppDataBody(t, 68, payload))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	if tokenStore.SaveCount() != 0 {
+		t.Fatalf("expected no token save on specialist mismatch, got %d", tokenStore.SaveCount())
+	}
+	if len(tg.sendTextCalls) < 2 {
+		t.Fatalf("expected mismatch warning + login prompt, got %d calls", len(tg.sendTextCalls))
+	}
+	last := tg.sendTextCalls[len(tg.sendTextCalls)-1]
+	if last.Keyboard == nil || len(last.Keyboard.InlineKeyboard) == 0 || last.Keyboard.InlineKeyboard[0][0].WebApp == nil {
+		t.Fatalf("expected login web_app keyboard, got %#v", last.Keyboard)
+	}
+}
+
+func TestHandlerWebAppDataInvalidPayloadShowsLogin(t *testing.T) {
+	store := newInMemorySessionStore()
+	tokenStore := newMockTokenStore()
+	tg := newMockTelegramGateway()
+	h := newTestHandlerWithTokenStore(t, store, nil, nil, nil, tokenStore, tg)
+
+	rec := sendWebhook(t, h, "secret", makeWebAppDataBody(t, 69, "{bad json"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	if tokenStore.SaveCount() != 0 {
+		t.Fatalf("expected no token save on invalid payload, got %d", tokenStore.SaveCount())
+	}
+	if len(tg.sendTextCalls) < 2 {
+		t.Fatalf("expected error + login prompt, got %d calls", len(tg.sendTextCalls))
+	}
+	last := tg.sendTextCalls[len(tg.sendTextCalls)-1]
+	if last.Keyboard == nil || len(last.Keyboard.InlineKeyboard) == 0 || last.Keyboard.InlineKeyboard[0][0].WebApp == nil {
+		t.Fatalf("expected login web_app keyboard, got %#v", last.Keyboard)
+	}
+}
+
 func TestHandlerCallbackConfirmSuccessClearsPendingPlan(t *testing.T) {
 	store := newInMemorySessionStore()
 	now := time.Now().UTC()
 	seed := &session.Session{
-		ChatID:    17,
-		Timezone:  "UTC",
+		ChatID:     17,
+		Timezone:   "UTC",
 		ProviderID: "prov-1",
 		PendingPlan: &session.PendingPlan{
 			ID:           "plan-1",
@@ -785,8 +977,8 @@ func TestHandlerCallbackConfirmSuccessClearsPendingPlan(t *testing.T) {
 func TestHandlerCallbackCancelDoesNotCallACPAndClearsPendingPlan(t *testing.T) {
 	store := newInMemorySessionStore()
 	seed := &session.Session{
-		ChatID:    18,
-		Timezone:  "UTC",
+		ChatID:     18,
+		Timezone:   "UTC",
 		ProviderID: "prov-1",
 		PendingPlan: &session.PendingPlan{
 			ID:           "plan-2",
@@ -875,6 +1067,70 @@ func TestHandlerCallbackConfirmContractBlockedShowsDeepLinkAndClearsPending(t *t
 	}
 	if saved.PendingPlan != nil {
 		t.Fatal("pending plan must be cleared after contract-blocked confirm")
+	}
+}
+
+func TestHandlerCallbackSlotSelectionUsesPendingSnapshotWithoutProviderRefetch(t *testing.T) {
+	store := newInMemorySessionStore()
+	now := time.Now().UTC().Truncate(time.Second)
+	seed := &session.Session{
+		ChatID:     70,
+		Timezone:   "UTC",
+		ProviderID: "prov-1",
+		PendingPlan: &session.PendingPlan{
+			ID:           "plan-slot",
+			PreviewMsgID: 99,
+			CreatedAt:    now,
+			Plan: interpreter.ActionPlan{
+				Intent:     interpreter.IntentCreateBooking,
+				Confidence: 0.9,
+				Params: interpreter.ActionParams{
+					ServiceID: "svc-1",
+				},
+			},
+			SlotCandidates: []session.PendingSlotCandidate{
+				{
+					ID:        "slot-1",
+					ServiceID: "svc-1",
+					StartAt:   now.Add(30 * time.Minute).Format(time.RFC3339),
+					EndAt:     now.Add(90 * time.Minute).Format(time.RFC3339),
+				},
+			},
+		},
+	}
+	if err := store.Save(context.Background(), seed); err != nil {
+		t.Fatalf("seed save: %v", err)
+	}
+
+	provider := &mockProvider{
+		findSlotsFn: func(ctx context.Context, providerID string, req domain.SlotSearchRequest) ([]domain.Slot, error) {
+			return nil, errors.New("must not call provider.FindSlots on slot callback")
+		},
+	}
+	tg := newMockTelegramGateway()
+	h := newTestHandler(t, store, nil, provider, nil, tg)
+	h.clock = func() time.Time { return now.Add(1 * time.Minute) }
+
+	rec := sendWebhook(t, h, "secret", makeCallbackBody(t, 70, "cb-slot", SlotData(0, "plan-slot"), 99))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	if provider.FindSlotsCallCount() != 0 {
+		t.Fatalf("expected provider.FindSlots call count 0, got %d", provider.FindSlotsCallCount())
+	}
+	if len(tg.finalizeCalls) == 0 {
+		t.Fatal("expected finalize call for create confirm preview")
+	}
+
+	saved, err := store.Get(context.Background(), 70)
+	if err != nil {
+		t.Fatalf("store.Get: %v", err)
+	}
+	if saved.PendingPlan == nil {
+		t.Fatal("expected pending plan to persist")
+	}
+	if saved.PendingPlan.Plan.Params.SlotID != "slot-1" {
+		t.Fatalf("expected selected slot id slot-1, got %q", saved.PendingPlan.Plan.Params.SlotID)
 	}
 }
 
