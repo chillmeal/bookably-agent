@@ -944,5 +944,26 @@ Acceptance criteria:
   - availability intents (`set_working_hours`, `add_break`, `close_range`) execute through ACP using `/specialist/schedule/commit` payload from pending preview snapshot;
   - `create_booking` confirm remains contract-blocked with deep-link fallback.
 
+## Iteration 12 note (No-key readiness + Mini App bridge + VPS wiring prep, 2026-03-23)
+
+- No-key runtime baseline expanded:
+  - `LLM_PROVIDER=stub` added as a first-class runtime mode;
+  - `LLM_API_KEY` is required only for real providers (`anthropic`, `openai`);
+  - `cmd/agent` LLM factory now supports deterministic no-network stub client.
+- Deploy artifacts added for VPS path-routing mode:
+  - `deploy/docker-compose.agent.yml`;
+  - `deploy/.env.agent.example`;
+  - `deploy/nginx/app.bookably.ru.agent-snippet.conf` (`/bot/webhook`, `/bot/health`).
+- Mini App bridge (`booking-backend/apps/web`) implemented for `mode=bot_auth`:
+  - after `bootstrapSession()`, app auto-sends `sendData({ token, refreshToken, specialistId })` to bot in TMA context;
+  - one-shot guard via `sessionStorage`;
+  - non-TMA `mode=bot_auth` flow is blocked with explicit user hint to open from Telegram.
+- Runtime limitation remains explicit:
+  - availability write intents are strict-real;
+  - `create_booking` execution remains contract-blocked until specialist-initiated create-booking backend contract is published.
+- Status integrity preserved:
+  - `P2-05` remains `IN PROGRESS` until live LLM run with real key;
+  - `P8-01..P8-04` remain `TODO` until environment credentials/deploy smoke are completed.
+
 Update `status` fields and checkboxes as tasks are completed.  
 Blocked count is now zero in backlog status; backend create-booking contract gap is tracked as a runtime limitation note.
