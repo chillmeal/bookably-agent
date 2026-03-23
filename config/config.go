@@ -27,8 +27,8 @@ type Config struct {
 	BookablySpecialistID string `envconfig:"BOOKABLY_SPECIALIST_ID" required:"true"`
 
 	// LLM
-	LLMProvider string `envconfig:"LLM_PROVIDER" required:"true"` // anthropic | openai
-	LLMAPIKey   string `envconfig:"LLM_API_KEY" required:"true"`
+	LLMProvider string `envconfig:"LLM_PROVIDER" required:"true"` // anthropic | openai | stub
+	LLMAPIKey   string `envconfig:"LLM_API_KEY" default:""`
 	LLMModel    string `envconfig:"LLM_MODEL" default:""` // empty = provider default
 
 	// Mini App
@@ -64,7 +64,6 @@ func Load() (*Config, error) {
 		"BOOKABLY_API_URL":       c.BookablyAPIURL,
 		"BOOKABLY_SPECIALIST_ID": c.BookablySpecialistID,
 		"LLM_PROVIDER":           c.LLMProvider,
-		"LLM_API_KEY":            c.LLMAPIKey,
 		"MINI_APP_URL":           c.MiniAppURL,
 	}
 	for name, value := range required {
@@ -75,8 +74,13 @@ func Load() (*Config, error) {
 
 	switch c.LLMProvider {
 	case "anthropic", "openai":
+		if strings.TrimSpace(c.LLMAPIKey) == "" {
+			return nil, fmt.Errorf("config: missing required variable LLM_API_KEY for provider %s", c.LLMProvider)
+		}
+	case "stub":
+		// LLM_API_KEY intentionally optional for stub mode.
 	default:
-		return nil, fmt.Errorf("config: LLM_PROVIDER must be 'anthropic' or 'openai', got %q", c.LLMProvider)
+		return nil, fmt.Errorf("config: LLM_PROVIDER must be 'anthropic', 'openai', or 'stub', got %q", c.LLMProvider)
 	}
 
 	return &c, nil

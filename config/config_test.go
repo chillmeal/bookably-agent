@@ -196,3 +196,20 @@ func TestLoadConfig_InvalidProvider(t *testing.T) {
 		t.Fatalf("error %q does not reference LLM_PROVIDER", err.Error())
 	}
 }
+
+func TestLoadConfig_StubProviderWithoutAPIKey(t *testing.T) {
+	setBaseEnv(t)
+	t.Setenv("LLM_PROVIDER", "stub")
+	t.Setenv("LLM_API_KEY", "")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() unexpected error for stub provider: %v", err)
+	}
+	if cfg.LLMProvider != "stub" {
+		t.Fatalf("LLMProvider mismatch: %q", cfg.LLMProvider)
+	}
+	if cfg.LLMAPIKey != "" {
+		t.Fatalf("LLMAPIKey should be empty for stub provider, got %q", cfg.LLMAPIKey)
+	}
+}

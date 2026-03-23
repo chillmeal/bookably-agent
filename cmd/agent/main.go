@@ -153,6 +153,8 @@ func buildLLMClient(cfg *config.Config) (llm.LLMClient, error) {
 		return llm.NewAnthropicClientFromConfig(cfg)
 	case "openai":
 		return llm.NewOpenAIClientFromConfig(cfg)
+	case "stub":
+		return llm.NewStubClient(), nil
 	default:
 		return nil, fmt.Errorf("unsupported LLM provider %q", cfg.LLMProvider)
 	}
