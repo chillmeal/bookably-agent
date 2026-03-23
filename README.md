@@ -14,7 +14,7 @@ Telegram-native AI booking operations agent for service providers. The agent int
 ### 1) Prepare environment
 
 1. Copy `.env.example` to `.env`.
-2. Fill required secrets (`TG_BOT_TOKEN`, `ACP_API_KEY`, etc.). `LLM_API_KEY` is required only when `LLM_PROVIDER=anthropic` or `LLM_PROVIDER=openai`.
+2. Fill required secrets (`TG_BOT_TOKEN`, `ACP_API_KEY`, etc.). `LLM_API_KEY` is required for real providers (`anthropic`, `openai`, `amvera`).
 
 ### 2) Start local dependencies
 
@@ -50,8 +50,8 @@ go build ./...
 | `ACP_API_KEY` | Yes | - | ACP API key |
 | `BOOKABLY_API_URL` | Yes | - | Bookably API base URL |
 | `BOOKABLY_SPECIALIST_ID` | Yes | - | Single-provider specialist ID for bot runtime |
-| `LLM_PROVIDER` | Yes | - | `anthropic`, `openai`, or `stub` |
-| `LLM_API_KEY` | Conditional | - | Required only for `anthropic/openai`, optional for `stub` |
+| `LLM_PROVIDER` | Yes | - | `anthropic`, `openai`, `amvera`, or `stub` |
+| `LLM_API_KEY` | Conditional | - | Required for `anthropic/openai/amvera`, optional for `stub` |
 | `LLM_MODEL` | No | provider default | Optional model override |
 | `MINI_APP_URL` | Yes | - | Telegram Mini App URL |
 | `PORT` | No | `8080` | HTTP server port |

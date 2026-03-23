@@ -241,6 +241,12 @@ Run:
 
 `go test -tags integration -run TestClassifier ./internal/interpreter/`
 
+Latest live run note (2026-03-23):
+
+- `LLM_PROVIDER=amvera`, `LLM_MODEL=gpt-5` executed against real endpoint.
+- Status remains `IN PROGRESS`: provider returned `402` (`Run out of tokens` / billing blocked), so 35-case acceptance gate could not be completed.
+- Strict policy remains in force: `amvera` is `gpt-5` only, no model fallback.
+
 ---
 
 ## Phase 3 - Bookably Adapter
@@ -948,7 +954,7 @@ Acceptance criteria:
 
 - No-key runtime baseline expanded:
   - `LLM_PROVIDER=stub` added as a first-class runtime mode;
-  - `LLM_API_KEY` is required only for real providers (`anthropic`, `openai`);
+  - `LLM_API_KEY` is required only for real providers (`anthropic`, `openai`, `amvera`);
   - `cmd/agent` LLM factory now supports deterministic no-network stub client.
 - Deploy artifacts added for VPS path-routing mode:
   - `deploy/docker-compose.agent.yml`;
@@ -964,6 +970,19 @@ Acceptance criteria:
 - Status integrity preserved:
   - `P2-05` remains `IN PROGRESS` until live LLM run with real key;
   - `P8-01..P8-04` remain `TODO` until environment credentials/deploy smoke are completed.
+
+## Iteration 13 note (Amvera live integration, 2026-03-23)
+
+- Added real `amvera` provider integration in `bookably-agent` (`internal/llm/amvera.go`) with wire contract:
+  - `POST https://kong-proxy.yc.amvera.ru/api/v1/models/gpt`
+  - header `X-Auth-Token: Bearer <LLM_API_KEY>`
+  - response mapping from `choices[0].message.text`.
+- Strict model policy is now runtime-enforced:
+  - `amvera` accepts only `LLM_MODEL=gpt-5`;
+  - config defaults `LLM_MODEL` to `gpt-5` for `amvera` and rejects other models.
+- Live classifier attempt executed with `amvera/gpt-5`, but acceptance gate is still blocked by provider billing (`402` / run out of tokens), so:
+  - `P2-05` stays `IN PROGRESS`;
+  - no fallback provider/model was introduced.
 
 Update `status` fields and checkboxes as tasks are completed.  
 Blocked count is now zero in backlog status; backend create-booking contract gap is tracked as a runtime limitation note.

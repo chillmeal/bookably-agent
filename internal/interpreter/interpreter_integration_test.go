@@ -134,6 +134,8 @@ func newIntegrationLLMClient(provider, apiKey, model string) (llm.LLMClient, err
 		return llm.NewAnthropicClient(apiKey, opts)
 	case "openai":
 		return llm.NewOpenAIClient(apiKey, opts)
+	case "amvera":
+		return llm.NewAmveraClient(apiKey, opts)
 	default:
 		return nil, fmt.Errorf("unsupported LLM_PROVIDER %q", provider)
 	}

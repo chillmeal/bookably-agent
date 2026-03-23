@@ -213,3 +213,47 @@ func TestLoadConfig_StubProviderWithoutAPIKey(t *testing.T) {
 		t.Fatalf("LLMAPIKey should be empty for stub provider, got %q", cfg.LLMAPIKey)
 	}
 }
+
+func TestLoadConfig_AmveraProviderRequiresAPIKey(t *testing.T) {
+	setBaseEnv(t)
+	t.Setenv("LLM_PROVIDER", "amvera")
+	t.Setenv("LLM_API_KEY", "")
+
+	_, err := Load()
+	if err == nil {
+		t.Fatal("expected error for amvera provider without LLM_API_KEY")
+	}
+	if !strings.Contains(err.Error(), "LLM_API_KEY") {
+		t.Fatalf("error %q does not mention LLM_API_KEY", err.Error())
+	}
+}
+
+func TestLoadConfig_AmveraDefaultsModelToGPT5(t *testing.T) {
+	setBaseEnv(t)
+	t.Setenv("LLM_PROVIDER", "amvera")
+	t.Setenv("LLM_API_KEY", "amv-key")
+	t.Setenv("LLM_MODEL", "")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() unexpected error: %v", err)
+	}
+	if cfg.LLMModel != "gpt-5" {
+		t.Fatalf("expected LLM_MODEL default gpt-5, got %q", cfg.LLMModel)
+	}
+}
+
+func TestLoadConfig_AmveraRejectsNonGPT5Model(t *testing.T) {
+	setBaseEnv(t)
+	t.Setenv("LLM_PROVIDER", "amvera")
+	t.Setenv("LLM_API_KEY", "amv-key")
+	t.Setenv("LLM_MODEL", "gpt-4")
+
+	_, err := Load()
+	if err == nil {
+		t.Fatal("expected strict model policy error for amvera")
+	}
+	if !strings.Contains(err.Error(), "LLM_MODEL=gpt-5") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}

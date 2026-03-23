@@ -27,7 +27,7 @@ type Config struct {
 	BookablySpecialistID string `envconfig:"BOOKABLY_SPECIALIST_ID" required:"true"`
 
 	// LLM
-	LLMProvider string `envconfig:"LLM_PROVIDER" required:"true"` // anthropic | openai | stub
+	LLMProvider string `envconfig:"LLM_PROVIDER" required:"true"` // anthropic | openai | amvera | stub
 	LLMAPIKey   string `envconfig:"LLM_API_KEY" default:""`
 	LLMModel    string `envconfig:"LLM_MODEL" default:""` // empty = provider default
 
@@ -73,14 +73,22 @@ func Load() (*Config, error) {
 	}
 
 	switch c.LLMProvider {
-	case "anthropic", "openai":
+	case "anthropic", "openai", "amvera":
 		if strings.TrimSpace(c.LLMAPIKey) == "" {
 			return nil, fmt.Errorf("config: missing required variable LLM_API_KEY for provider %s", c.LLMProvider)
+		}
+		if c.LLMProvider == "amvera" {
+			model := strings.TrimSpace(c.LLMModel)
+			if model == "" {
+				c.LLMModel = "gpt-5"
+			} else if model != "gpt-5" {
+				return nil, fmt.Errorf("config: strict model policy for amvera requires LLM_MODEL=gpt-5, got %q", c.LLMModel)
+			}
 		}
 	case "stub":
 		// LLM_API_KEY intentionally optional for stub mode.
 	default:
-		return nil, fmt.Errorf("config: LLM_PROVIDER must be 'anthropic', 'openai', or 'stub', got %q", c.LLMProvider)
+		return nil, fmt.Errorf("config: LLM_PROVIDER must be 'anthropic', 'openai', 'amvera', or 'stub', got %q", c.LLMProvider)
 	}
 
 	return &c, nil
