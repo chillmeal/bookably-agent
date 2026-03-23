@@ -1,0 +1,50 @@
+version: "3.9"
+
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+
+  agent:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env.agent
+    depends_on:
+      - redis
+    ports:
+      - "127.0.0.1:8080:8080"
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    profiles: ["acp"]
+    environment:
+      POSTGRES_DB: acp
+      POSTGRES_USER: acp
+      POSTGRES_PASSWORD: acp
+    volumes:
+      - acp_postgres_data:/var/lib/postgresql/data
+
+  acp:
+    image: ghcr.io/chillmeal/ton-acp:latest
+    restart: unless-stopped
+    profiles: ["acp"]
+    depends_on:
+      - postgres
+    environment:
+      ACP_SERVER_PORT: 8080
+      ACP_AUTH_TOKEN: ${ACP_API_KEY}
+      ACP_DATABASE_URL: postgres://acp:acp@postgres:5432/acp?sslmode=disable
+      ACP_TON_EXECUTOR_MODE: mock
+    ports:
+      - "127.0.0.1:8181:8080"
+
+volumes:
+  redis_data:
+  acp_postgres_data:
