@@ -501,19 +501,19 @@ Acceptance criteria:
 
 - [x] `BuildCancelBookingRun()` -> single HTTP step `POST /specialist/bookings/{id}/cancel`
 - [x] `BuildCreateBookingRun()` -> single HTTP step `POST /public/bookings`
-- [x] `BuildAvailabilityRun(slots []domain.Slot)` -> `N` delete steps + 1 commit step
+- [x] `BuildAvailabilityRun(create, delete)` -> single HTTP step `POST /specialist/schedule/commit` with operation-group payload in body
 - [x] Each step has correct capability string (`booking.cancel`, `booking.create`, etc.)
 - [x] Each step passes `Idempotency-Key` from `PendingPlan.IdempotencyKey`
 - [x] Each run metadata includes `chat_id`, `specialist_id`, `intent`, `risk_level`, `raw_message`
-- [x] Slot-delete key format: `{baseKey}:del:{slotIndex}`
 - [x] Commit key format: `{baseKey}:commit`
 - [x] Unit test: `BuildCancelBookingRun` validates step URL/method/headers
-- [x] Unit test: availability run with 3 slots -> 4 steps total (3 delete + commit)
+- [x] Unit test: availability run validates commit body shape (`create[]`, `delete[]`) and commit idempotency key
 
 Notes:
 
-- Availability builder remains provisional pending migration to schedule-commit operation-group payloads.
+- Availability execution is now strict-real via `/specialist/schedule/commit` operation-group payload.
 - `cancel_booking` step uses Doc 05 precedence (`POST .../cancel`) and is canonicalized in this ticket.
+- `create_booking` execution remains fail-safe blocked until backend publishes specialist-initiated create-booking contract for named clients.
 
 ---
 
@@ -921,6 +921,28 @@ Acceptance criteria:
 - `P2-05` remains `IN PROGRESS` until live LLM execution is run with real provider credentials.
 - `P8-01..P8-04` remain `TODO` because they require real environment credentials, deployment target, and end-to-end API availability.
 - Workflow/plan documents are intentionally local-only per current policy (`CODEX_WORKFLOW` and `ENGINEERING_PLAN` paths are gitignored).
+
+## Iteration 11 note (Mini App auth + runtime readiness, 2026-03-23)
+
+- README cleanup completed: documentation section removed (including stale `docs/CODEX_WORKFLOW.md` reference).
+- Auth entrypoint is now canonical via Mini App `web_app_data`:
+  - bot does not call `/auth/tma` directly;
+  - bot accepts payload `{ token, refreshToken, specialistId }`;
+  - token is saved to Redis token store, provider/session are hydrated.
+- Single-provider guard enabled via `BOOKABLY_SPECIALIST_ID`:
+  - `specialistId` mismatch is rejected;
+  - unauthenticated messages receive login `web_app` button (`?mode=bot_auth`).
+- Timezone source fixed:
+  - removed `/me.timezone` assumption;
+  - timezone is resolved from `/api/v1/public/specialist/profile?specialistId=...`;
+  - empty timezone now returns explicit validation error (no silent UTC fallback).
+- Runtime entrypoint added: `cmd/agent/main.go` with full wiring (`config`, Redis/session/token store, LLM/interpreter, Bookably adapter, ACP runner/executor, Telegram gateway, `/webhook` and `/health`).
+- Slot-selection race fixed:
+  - callback uses `PendingPlan` slot snapshot;
+  - no re-fetch from `FindSlots` on slot button tap.
+- Strict-real write status:
+  - availability intents (`set_working_hours`, `add_break`, `close_range`) execute through ACP using `/specialist/schedule/commit` payload from pending preview snapshot;
+  - `create_booking` confirm remains contract-blocked with deep-link fallback.
 
 Update `status` fields and checkboxes as tasks are completed.  
 Blocked count is now zero in backlog status; backend create-booking contract gap is tracked as a runtime limitation note.
