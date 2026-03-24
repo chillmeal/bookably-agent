@@ -399,6 +399,7 @@ func (h *Handler) handleMessage(ctx context.Context, msg *telegramMessageUpdate)
 	AppendHistory(s, "user", userMessage)
 
 	if plan.Intent == interpreter.IntentUnknown || plan.Confidence < 0.5 {
+		s.ClarificationCount = 0
 		if _, err := h.telegram.Finalize(ctx, chatID, FormatUnknownIntent(), nil); err != nil {
 			return err
 		}
@@ -408,10 +409,12 @@ func (h *Handler) handleMessage(ctx context.Context, msg *telegramMessageUpdate)
 
 	if plan.NeedsClarification() {
 		s.ClarificationCount++
+		questionText := FormatClarification(plan.Clarifications[0].Question)
 		if s.ClarificationCount >= 2 {
-			return h.sendDeepLinkEscalation(ctx, s, chatID, "clarification_limit", string(plan.Intent))
+			questionText += "\n\n" + escapeV2("Если удобнее, можешь открыть Mini App, но в чате тоже продолжим после твоего ответа.")
+			s.ClarificationCount = 0
 		}
-		if _, err := h.telegram.Finalize(ctx, chatID, FormatClarification(plan.Clarifications[0].Question), nil); err != nil {
+		if _, err := h.telegram.Finalize(ctx, chatID, questionText, nil); err != nil {
 			return err
 		}
 		AppendHistory(s, "assistant", plan.Clarifications[0].Question)

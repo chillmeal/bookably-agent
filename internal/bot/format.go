@@ -9,6 +9,11 @@ import (
 	"github.com/chillmeal/bookably-agent/internal/domain"
 )
 
+const (
+	boldOpenMark  = "§B§"
+	boldCloseMark = "§/B§"
+)
+
 var markdownV2Escapes = map[rune]struct{}{
 	'_': {},
 	'*': {},
@@ -44,14 +49,14 @@ func escapeV2(in string) string {
 func FormatAvailabilityPreview(preview domain.Preview) string {
 	understood := strings.TrimSpace(preview.Summary)
 	if understood == "" {
-		understood = "Запрос на изменение расписания по интервалам."
+		understood = "Ок, меняем расписание по интервалам."
 	}
-	willDo := "Подготовил изменения расписания и проверил риски до применения."
+	willDo := "Я ничего не применяю сразу, сначала показываю изменения и жду подтверждение."
 	var action strings.Builder
-	action.WriteString(fmt.Sprintf("+ %d новых слотов\n", preview.AvailabilityChange.AddedSlots))
-	action.WriteString(fmt.Sprintf("- %d существующих слотов удалятся", preview.AvailabilityChange.RemovedSlots))
+	action.WriteString(fmt.Sprintf("• Добавится: %s\n", boldText(fmt.Sprintf("%d", preview.AvailabilityChange.AddedSlots))))
+	action.WriteString(fmt.Sprintf("• Удалится: %s", boldText(fmt.Sprintf("%d", preview.AvailabilityChange.RemovedSlots))))
 	if len(preview.Conflicts) > 0 {
-		action.WriteString("\n⚠️ Конфликты:")
+		action.WriteString("\n\n⚠️ Конфликты:")
 		for _, c := range preview.Conflicts {
 			line := fmt.Sprintf("\n• %s — %s в %s",
 				fallbackValue(c.ClientName, "клиент"),
@@ -61,7 +66,7 @@ func FormatAvailabilityPreview(preview domain.Preview) string {
 			action.WriteString(line)
 		}
 	}
-	next := "Проверь превью и нажми «✅ Применить» или «❌ Отменить»."
+	next := "Если всё верно, жми ✅ Применить. Если нужно скорректировать, жми ❌ Отменить."
 	return buildStructuredResponse(understood, willDo, action.String(), next)
 }
 
@@ -93,10 +98,10 @@ func FormatBookingListPreview(bookings []domain.Booking, tz *time.Location) stri
 	}
 
 	return buildStructuredResponse(
-		"Запрос на список записей.",
-		"Отсортировал записи по времени.",
+		"Понял, нужен список записей.",
+		"Собрал и отсортировал записи по времени.",
 		strings.TrimSpace(action.String()),
-		"Если нужно, задай точный день или диапазон.",
+		"Можешь уточнить период: например «на пятницу» или «на эту неделю».",
 	)
 }
 
@@ -112,10 +117,14 @@ func FormatCancelPreview(preview domain.Preview) string {
 
 	bk := preview.BookingResult
 	return buildStructuredResponse(
-		"Запрос на отмену записи.",
-		"Нашёл запись для отмены и проверил параметры.",
-		fmt.Sprintf("%s · %s · %s\n⚠️ Это действие необратимо.", fallbackValue(bk.ClientName, "Клиент"), fallbackValue(bk.ServiceName, "Услуга"), bk.At.Local().Format("02.01 15:04")),
-		"Подтверди отмену кнопкой «✅ Применить» или отмени действие.",
+		"Ок, готовлю отмену записи.",
+		"Нашёл нужную запись и проверил детали.",
+		fmt.Sprintf("• Клиент: %s\n• Услуга: %s\n• Время: %s\n⚠️ Это действие необратимо.",
+			boldText(fallbackValue(bk.ClientName, "Клиент")),
+			boldText(fallbackValue(bk.ServiceName, "Услуга")),
+			boldText(bk.At.Local().Format("02.01 15:04")),
+		),
+		"Подтверди отмену кнопкой ✅ Применить или отмени действие кнопкой ❌ Отменить.",
 	)
 }
 
@@ -148,10 +157,10 @@ func FormatCreatePreview(preview domain.Preview, tz *time.Location) string {
 		action.WriteString("\n")
 	}
 	return buildStructuredResponse(
-		"Запрос на создание записи.",
-		"Нашёл ближайшие доступные интервалы.",
+		"Понял, создаём запись.",
+		"Нашёл ближайшие свободные интервалы.",
 		strings.TrimSpace(action.String()),
-		"Выбери вариант кнопкой ниже, затем подтверди создание.",
+		"Выбери вариант кнопкой ниже, потом подтверди создание.",
 	)
 }
 
@@ -180,7 +189,7 @@ func FormatFindSlotResult(slots []domain.Slot, tz *time.Location) string {
 		action.WriteString(fmt.Sprintf("%d. %s\n", i+1, slot.Start.In(loc).Format("02.01 15:04")))
 	}
 	return buildStructuredResponse(
-		"Запрос на поиск ближайшего окна.",
+		"Понял, ищем ближайшее окно.",
 		"Подобрал ближайшие доступные интервалы.",
 		strings.TrimSpace(action.String()),
 		"Выбери подходящий вариант кнопкой ниже.",
@@ -192,8 +201,8 @@ func FormatClarification(q string) string {
 		q = "Уточни, пожалуйста, запрос."
 	}
 	return buildStructuredResponse(
-		"Нужна одна уточняющая деталь.",
-		"После ответа сразу продолжу выполнение запроса.",
+		"Нужна одна короткая деталь.",
+		"Сразу продолжу после твоего ответа.",
 		strings.TrimSpace(q),
 		"Ответь одним коротким сообщением.",
 	)
@@ -217,10 +226,10 @@ func FormatError(errType string) string {
 		)
 	case "timeout":
 		return buildStructuredResponse(
-			"Операция заняла слишком много времени.",
-			"Текущая попытка остановлена без изменений.",
-			"Команда не выполнена.",
-			"Повтори запрос. Примеры: «Покажи записи на завтра», «Закрой пятницу», «Отмени запись Ивана в четверг».",
+			"Похоже, сервис ответил слишком медленно.",
+			"Остановил попытку без изменений.",
+			"Команда пока не выполнена.",
+			"Примеры: «Покажи записи на завтра», «Закрой пятницу», «Отмени запись Ивана в четверг».",
 		)
 	case "forbidden":
 		return buildStructuredResponse(
@@ -231,10 +240,10 @@ func FormatError(errType string) string {
 		)
 	case "upstream":
 		return buildStructuredResponse(
-			"Внешний сервис временно недоступен.",
-			"Остановил выполнение, чтобы избежать дублирования.",
+			"Внешний сервис сейчас отвечает нестабильно.",
+			"Чтобы не сделать дубликаты, остановил выполнение.",
 			"Изменения не применены.",
-			"Подожди 10–20 секунд и повтори запрос.",
+			"Подожди 10–20 секунд и повтори команду.",
 		)
 	case "validation":
 		return buildStructuredResponse(
@@ -255,10 +264,10 @@ func FormatError(errType string) string {
 
 func FormatUnknownIntent() string {
 	return buildStructuredResponse(
-		"Команда вне поддерживаемых сценариев.",
-		"Могу помочь с расписанием и записями.",
+		"Похоже, команда вне моего сценария.",
+		"Я помогаю только с расписанием и записями.",
 		"Примеры:\n• Покажи записи на завтра\n• Закрой пятницу\n• Запиши Алину на массаж",
-		"Отправь одну из команд в похожем формате.",
+		"Напиши команду в похожем формате, и сразу продолжим.",
 	)
 }
 
@@ -293,7 +302,18 @@ func buildStructuredResponse(understood, willDo, action, next string) string {
 		b.WriteString("*")
 		b.WriteString(section.title)
 		b.WriteString(":*\n")
-		b.WriteString(escapeV2(body))
+		b.WriteString(renderBody(body))
 	}
 	return strings.TrimSpace(b.String())
+}
+
+func boldText(value string) string {
+	return boldOpenMark + strings.TrimSpace(value) + boldCloseMark
+}
+
+func renderBody(body string) string {
+	escaped := escapeV2(body)
+	escaped = strings.ReplaceAll(escaped, boldOpenMark, "*")
+	escaped = strings.ReplaceAll(escaped, boldCloseMark, "*")
+	return escaped
 }
