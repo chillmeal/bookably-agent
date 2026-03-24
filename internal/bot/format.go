@@ -48,7 +48,11 @@ func escapeV2(in string) string {
 
 func FormatAvailabilityPreview(preview domain.Preview) string {
 	var b strings.Builder
-	b.WriteString("Ок, подготовил изменения по расписанию.\n\n")
+	lead := strings.TrimSpace(preview.Summary)
+	if lead == "" {
+		lead = "Проверил изменения по расписанию"
+	}
+	b.WriteString(boldLead(lead))
 	b.WriteString("• Добавится: ")
 	b.WriteString(boldText(fmt.Sprintf("%d", preview.AvailabilityChange.AddedSlots)))
 	b.WriteString("\n")
@@ -68,13 +72,13 @@ func FormatAvailabilityPreview(preview domain.Preview) string {
 		}
 	}
 
-	b.WriteString("\nЕсли всё верно, жми ✅ Применить. Если нужно изменить параметры, жми ❌ Отменить.")
+	b.WriteString("\n\nЕсли всё верно, жми ✅ Применить. Если нужно изменить параметры, жми ❌ Отменить.")
 	return renderBody(strings.TrimSpace(b.String()))
 }
 
 func FormatBookingListPreview(bookings []domain.Booking, tz *time.Location) string {
 	if len(bookings) == 0 {
-		return renderBody("На выбранный период записей нет.\nПопробуй уточнить дату или диапазон.")
+		return renderBody(boldLead("На выбранный период записей нет") + "Попробуй уточнить дату или диапазон.")
 	}
 
 	loc := tz
@@ -87,7 +91,7 @@ func FormatBookingListPreview(bookings []domain.Booking, tz *time.Location) stri
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].At.Before(sorted[j].At) })
 
 	var b strings.Builder
-	b.WriteString("Вот что нашёл:\n")
+	b.WriteString(boldLead("Вот что нашёл"))
 	for _, booking := range sorted {
 		b.WriteString("• ")
 		b.WriteString(boldText(humanDateTime(booking.At, loc)))
@@ -102,12 +106,12 @@ func FormatBookingListPreview(bookings []domain.Booking, tz *time.Location) stri
 
 func FormatCancelPreview(preview domain.Preview) string {
 	if preview.BookingResult == nil {
-		return renderBody("Не получилось однозначно определить запись для отмены.\nУточни клиента или время.")
+		return renderBody(boldLead("Не получилось однозначно определить запись для отмены") + "Уточни клиента или время.")
 	}
 
 	bk := preview.BookingResult
 	var b strings.Builder
-	b.WriteString("Нашёл запись для отмены:\n")
+	b.WriteString(boldLead("Нашёл запись для отмены"))
 	b.WriteString("• Клиент: ")
 	b.WriteString(boldText(fallbackValue(bk.ClientName, "Клиент")))
 	b.WriteString("\n")
@@ -122,7 +126,7 @@ func FormatCancelPreview(preview domain.Preview) string {
 
 func FormatCancelCandidates(candidates []domain.Booking, tz *time.Location) string {
 	if len(candidates) == 0 {
-		return renderBody("По указанным данным записи не нашёл.\nПопробуй уточнить клиента или время.")
+		return renderBody(boldLead("По указанным данным записи не нашёл") + "Попробуй уточнить клиента или время.")
 	}
 	loc := tz
 	if loc == nil {
@@ -134,7 +138,8 @@ func FormatCancelCandidates(candidates []domain.Booking, tz *time.Location) stri
 	}
 
 	var b strings.Builder
-	b.WriteString("Нашёл несколько подходящих записей. Выбери нужную кнопкой ниже:\n")
+	b.WriteString(boldLead("Нашёл несколько подходящих записей"))
+	b.WriteString("Выбери нужную кнопкой ниже:\n")
 	for i := 0; i < max; i++ {
 		item := candidates[i]
 		b.WriteString("• ")
@@ -154,7 +159,7 @@ func FormatCreatePreview(preview domain.Preview, tz *time.Location) string {
 		loc = time.UTC
 	}
 	if len(preview.ProposedSlots) == 0 {
-		return renderBody("Свободных окон в текущем диапазоне нет.\nПопробуй другую дату или более широкий диапазон.")
+		return renderBody(boldLead("Свободных окон в текущем диапазоне нет") + "Попробуй другую дату или более широкий диапазон.")
 	}
 
 	max := len(preview.ProposedSlots)
@@ -162,7 +167,7 @@ func FormatCreatePreview(preview domain.Preview, tz *time.Location) string {
 		max = 2
 	}
 	var b strings.Builder
-	b.WriteString("Нашёл ближайшие свободные окна:\n")
+	b.WriteString(boldLead("Нашёл ближайшие свободные окна"))
 	for i := 0; i < max; i++ {
 		slot := preview.ProposedSlots[i]
 		b.WriteString("• ")
@@ -182,7 +187,7 @@ func FormatFindSlotResult(slots []domain.Slot, tz *time.Location) string {
 		loc = time.UTC
 	}
 	if len(slots) == 0 {
-		return renderBody("Пока не вижу свободных окон по этим условиям.\nПопробуй расширить диапазон времени.")
+		return renderBody(boldLead("Пока не вижу свободных окон по этим условиям") + "Попробуй расширить диапазон времени.")
 	}
 
 	max := len(slots)
@@ -190,7 +195,7 @@ func FormatFindSlotResult(slots []domain.Slot, tz *time.Location) string {
 		max = 2
 	}
 	var b strings.Builder
-	b.WriteString("Ближайшие варианты:\n")
+	b.WriteString(boldLead("Ближайшие варианты"))
 	for i := 0; i < max; i++ {
 		slot := slots[i]
 		b.WriteString(fmt.Sprintf("• %d) %s\n", i+1, boldText(humanDateTime(slot.Start, loc))))
@@ -204,30 +209,30 @@ func FormatClarification(q string) string {
 	if q == "" {
 		q = "Уточни, пожалуйста, детали запроса."
 	}
-	return renderBody("Нужна одна деталь, чтобы продолжить:\n• " + q)
+	return renderBody(boldLead("Нужна одна деталь, чтобы продолжить") + "• " + q)
 }
 
 func FormatError(errType string) string {
 	switch strings.ToLower(strings.TrimSpace(errType)) {
 	case "not_found":
-		return renderBody("Не нашёл подходящих данных по этому запросу.\nУточни клиента, услугу или дату.")
+		return renderBody(boldLead("Не нашёл подходящих данных по этому запросу") + "Уточни клиента, услугу или дату.")
 	case "conflict":
-		return renderBody("Нашёл несколько совпадений, и без выбора можно ошибиться.\nУточни клиента или время записи.")
+		return renderBody(boldLead("Нашёл несколько совпадений, и без выбора можно ошибиться") + "Уточни клиента или время записи.")
 	case "timeout":
-		return renderBody("Сервис ответил слишком медленно, поэтому остановил попытку без изменений.\nПримеры: «Покажи записи на завтра», «Закрой пятницу», «Отмени запись Ивана в четверг».")
+		return renderBody(boldLead("Сервис ответил слишком медленно, поэтому остановил попытку без изменений") + "Примеры: «Покажи записи на завтра», «Закрой пятницу», «Отмени запись Ивана в четверг».")
 	case "forbidden":
-		return renderBody("Недостаточно прав для этой операции.\nПроверь, что аккаунт активирован как специалист.")
+		return renderBody(boldLead("Недостаточно прав для этой операции") + "Проверь, что аккаунт активирован как специалист.")
 	case "upstream":
-		return renderBody("Внешний сервис сейчас отвечает нестабильно.\nПодожди 10–20 секунд и повтори команду.")
+		return renderBody(boldLead("Внешний сервис сейчас отвечает нестабильно") + "Подожди 10–20 секунд и повтори команду.")
 	case "validation":
-		return renderBody("Не хватает обязательных деталей для выполнения команды.\nУточни дату, время или услугу.")
+		return renderBody(boldLead("Не хватает обязательных деталей для выполнения команды") + "Уточни дату, время или услугу.")
 	default:
-		return renderBody("Не удалось обработать запрос.\nПовтори попытку или уточни формулировку.")
+		return renderBody(boldLead("Не удалось обработать запрос") + "Повтори попытку или уточни формулировку.")
 	}
 }
 
 func FormatUnknownIntent() string {
-	return renderBody("Пока не понял команду.\nПопробуй так:\n• Покажи записи на завтра\n• Закрой пятницу\n• Запиши Алину на массаж")
+	return renderBody(boldLead("Пока не понял команду") + "Попробуй так:\n• Покажи записи на завтра\n• Закрой пятницу\n• Запиши Алину на массаж")
 }
 
 func fallbackValue(value, fallback string) string {
@@ -247,6 +252,10 @@ func renderBody(body string) string {
 
 func boldText(value string) string {
 	return boldOpenMark + strings.TrimSpace(value) + boldCloseMark
+}
+
+func boldLead(value string) string {
+	return boldText(value) + "\n\n"
 }
 
 func humanDateTime(ts time.Time, tz *time.Location) string {

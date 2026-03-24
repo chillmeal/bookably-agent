@@ -691,6 +691,13 @@ func (h *Handler) handleWritePreview(ctx context.Context, s *session.Session, pl
 	if location == nil {
 		location = time.UTC
 	}
+	if plan.Intent == interpreter.IntentSetWorkingHours ||
+		plan.Intent == interpreter.IntentAddBreak ||
+		plan.Intent == interpreter.IntentCloseRange {
+		if summary := humanAvailabilityIntentSummary(plan.Intent, plan.Params, location); summary != "" {
+			preview.Summary = summary
+		}
+	}
 
 	if plan.Intent == interpreter.IntentCreateBooking {
 		if len(preview.ProposedSlots) == 0 {
@@ -1145,6 +1152,91 @@ func hasCancelDateContext(p interpreter.ActionParams) bool {
 		return true
 	}
 	return false
+}
+
+func humanAvailabilityIntentSummary(intent interpreter.Intent, p interpreter.ActionParams, tz *time.Location) string {
+	if p.DateRange == nil || strings.TrimSpace(p.DateRange.From) == "" {
+		return ""
+	}
+	from, to, ok := parseIntentDateRange(p.DateRange, tz)
+	if !ok {
+		return ""
+	}
+
+	datePart := humanDateSpan(from, to)
+	switch intent {
+	case interpreter.IntentSetWorkingHours:
+		if p.WorkingHours == nil {
+			return datePart
+		}
+		return fmt.Sprintf("%s с %s до %s", datePart, strings.TrimSpace(p.WorkingHours.From), strings.TrimSpace(p.WorkingHours.To))
+	case interpreter.IntentAddBreak:
+		breakSlot := p.BreakSlot
+		if breakSlot == nil && len(p.Breaks) > 0 {
+			breakSlot = &p.Breaks[0]
+		}
+		if breakSlot == nil {
+			return datePart
+		}
+		return fmt.Sprintf("%s, перерыв с %s до %s", datePart, strings.TrimSpace(breakSlot.From), strings.TrimSpace(breakSlot.To))
+	case interpreter.IntentCloseRange:
+		if p.TimeRange != nil && strings.TrimSpace(p.TimeRange.From) != "" && strings.TrimSpace(p.TimeRange.To) != "" {
+			return fmt.Sprintf("%s, закрыть с %s до %s", datePart, strings.TrimSpace(p.TimeRange.From), strings.TrimSpace(p.TimeRange.To))
+		}
+		return fmt.Sprintf("%s, закрыть день", datePart)
+	default:
+		return ""
+	}
+}
+
+func parseIntentDateRange(r *interpreter.DateRange, tz *time.Location) (time.Time, time.Time, bool) {
+	loc := tz
+	if loc == nil {
+		loc = time.UTC
+	}
+	from, err := time.ParseInLocation("2006-01-02", strings.TrimSpace(r.From), loc)
+	if err != nil {
+		return time.Time{}, time.Time{}, false
+	}
+	to := from
+	if strings.TrimSpace(r.To) != "" {
+		parsedTo, err := time.ParseInLocation("2006-01-02", strings.TrimSpace(r.To), loc)
+		if err != nil {
+			return time.Time{}, time.Time{}, false
+		}
+		to = parsedTo
+	}
+	if to.Before(from) {
+		return time.Time{}, time.Time{}, false
+	}
+	return from, to, true
+}
+
+func humanDateSpan(from, to time.Time) string {
+	if from.Year() == to.Year() && from.YearDay() == to.YearDay() {
+		return humanDateOnly(from)
+	}
+	return fmt.Sprintf("с %s по %s", humanDateOnly(from), humanDateOnly(to))
+}
+
+func humanDateOnly(ts time.Time) string {
+	months := []string{
+		"",
+		"января",
+		"февраля",
+		"марта",
+		"апреля",
+		"мая",
+		"июня",
+		"июля",
+		"августа",
+		"сентября",
+		"октября",
+		"ноября",
+		"декабря",
+	}
+	month := months[int(ts.Month())]
+	return fmt.Sprintf("%d %s", ts.Day(), month)
 }
 
 func (h *Handler) withActorContext(ctx context.Context, s *session.Session) context.Context {

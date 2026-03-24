@@ -146,7 +146,7 @@ func (c *Client) newRequest(ctx context.Context, method, path string, body []byt
 	if err != nil {
 		return nil, fmt.Errorf("acp client: build request: %w", err)
 	}
-	req.Header.Set("Authorization", c.apiKey)
+	req.Header.Set("Authorization", "Bearer "+c.apiKey)
 	req.Header.Set("Content-Type", "application/json")
 	return req, nil
 }
