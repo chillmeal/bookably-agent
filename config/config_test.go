@@ -14,7 +14,7 @@ var allEnvKeys = []string{
 	"ACP_BASE_URL",
 	"ACP_API_KEY",
 	"BOOKABLY_API_URL",
-	"BOOKABLY_SPECIALIST_ID",
+	"BOOKABLY_BOT_SERVICE_KEY",
 	"LLM_PROVIDER",
 	"LLM_API_KEY",
 	"LLM_MODEL",
@@ -24,6 +24,7 @@ var allEnvKeys = []string{
 	"LLM_TIMEOUT",
 	"SESSION_TTL",
 	"PLAN_TTL",
+	"WORKER_TIMEOUT",
 	"ACP_POLL_INTERVAL",
 	"ACP_POLL_TIMEOUT",
 	"BOOKABLY_HTTP_TIMEOUT",
@@ -43,16 +44,17 @@ func setBaseEnv(t *testing.T) {
 	t.Setenv("ACP_BASE_URL", "http://localhost:8181")
 	t.Setenv("ACP_API_KEY", "acp-key")
 	t.Setenv("BOOKABLY_API_URL", "http://localhost:3000")
-	t.Setenv("BOOKABLY_SPECIALIST_ID", "spec-1")
-	t.Setenv("LLM_PROVIDER", "anthropic")
+	t.Setenv("BOOKABLY_BOT_SERVICE_KEY", "bot-service-key")
+	t.Setenv("LLM_PROVIDER", "openrouter")
 	t.Setenv("LLM_API_KEY", "llm-key")
-	t.Setenv("LLM_MODEL", "claude-sonnet")
+	t.Setenv("LLM_MODEL", "openai/gpt-5.4-nano")
 	t.Setenv("MINI_APP_URL", "https://t.me/bookably_bot/app")
 	t.Setenv("PORT", "8080")
 	t.Setenv("LOG_LEVEL", "debug")
 	t.Setenv("LLM_TIMEOUT", "15m")
 	t.Setenv("SESSION_TTL", "24h")
 	t.Setenv("PLAN_TTL", "15m")
+	t.Setenv("WORKER_TIMEOUT", "90s")
 	t.Setenv("ACP_POLL_INTERVAL", "2s")
 	t.Setenv("ACP_POLL_TIMEOUT", "30s")
 	t.Setenv("BOOKABLY_HTTP_TIMEOUT", "5s")
@@ -90,9 +92,9 @@ func TestLoadConfig_MissingRequired(t *testing.T) {
 			errorText: "LLM_API_KEY",
 		},
 		{
-			name:      "missing bookably specialist id",
-			missing:   "BOOKABLY_SPECIALIST_ID",
-			errorText: "BOOKABLY_SPECIALIST_ID",
+			name:      "missing bookably bot service key",
+			missing:   "BOOKABLY_BOT_SERVICE_KEY",
+			errorText: "BOOKABLY_BOT_SERVICE_KEY",
 		},
 	}
 
@@ -141,16 +143,16 @@ func TestLoadConfig_ValidEnv(t *testing.T) {
 	if cfg.BookablyAPIURL != "http://localhost:3000" {
 		t.Fatalf("BookablyAPIURL mismatch: %q", cfg.BookablyAPIURL)
 	}
-	if cfg.BookablySpecialistID != "spec-1" {
-		t.Fatalf("BookablySpecialistID mismatch: %q", cfg.BookablySpecialistID)
+	if cfg.BookablyBotServiceKey != "bot-service-key" {
+		t.Fatalf("BookablyBotServiceKey mismatch: %q", cfg.BookablyBotServiceKey)
 	}
-	if cfg.LLMProvider != "anthropic" {
+	if cfg.LLMProvider != "openrouter" {
 		t.Fatalf("LLMProvider mismatch: %q", cfg.LLMProvider)
 	}
 	if cfg.LLMAPIKey != "llm-key" {
 		t.Fatalf("LLMAPIKey mismatch: %q", cfg.LLMAPIKey)
 	}
-	if cfg.LLMModel != "claude-sonnet" {
+	if cfg.LLMModel != "openai/gpt-5.4-nano" {
 		t.Fatalf("LLMModel mismatch: %q", cfg.LLMModel)
 	}
 	if cfg.MiniAppURL != "https://t.me/bookably_bot/app" {
@@ -175,6 +177,9 @@ func TestLoadConfig_ValidEnv(t *testing.T) {
 	}
 	if cfg.PlanTTL != 15*time.Minute {
 		t.Fatalf("PlanTTL mismatch: got %s", cfg.PlanTTL)
+	}
+	if cfg.WorkerTimeout != 90*time.Second {
+		t.Fatalf("WorkerTimeout mismatch: got %s", cfg.WorkerTimeout)
 	}
 	if cfg.ACPPollTimeout != 30*time.Second {
 		t.Fatalf("ACPPollTimeout mismatch: got %s", cfg.ACPPollTimeout)
@@ -214,46 +219,46 @@ func TestLoadConfig_StubProviderWithoutAPIKey(t *testing.T) {
 	}
 }
 
-func TestLoadConfig_AmveraProviderRequiresAPIKey(t *testing.T) {
+func TestLoadConfig_OpenRouterProviderRequiresAPIKey(t *testing.T) {
 	setBaseEnv(t)
-	t.Setenv("LLM_PROVIDER", "amvera")
+	t.Setenv("LLM_PROVIDER", "openrouter")
 	t.Setenv("LLM_API_KEY", "")
 
 	_, err := Load()
 	if err == nil {
-		t.Fatal("expected error for amvera provider without LLM_API_KEY")
+		t.Fatal("expected error for openrouter provider without LLM_API_KEY")
 	}
 	if !strings.Contains(err.Error(), "LLM_API_KEY") {
 		t.Fatalf("error %q does not mention LLM_API_KEY", err.Error())
 	}
 }
 
-func TestLoadConfig_AmveraDefaultsModelToGPT5(t *testing.T) {
+func TestLoadConfig_OpenRouterDefaultsModel(t *testing.T) {
 	setBaseEnv(t)
-	t.Setenv("LLM_PROVIDER", "amvera")
-	t.Setenv("LLM_API_KEY", "amv-key")
+	t.Setenv("LLM_PROVIDER", "openrouter")
+	t.Setenv("LLM_API_KEY", "or-key")
 	t.Setenv("LLM_MODEL", "")
 
 	cfg, err := Load()
 	if err != nil {
 		t.Fatalf("Load() unexpected error: %v", err)
 	}
-	if cfg.LLMModel != "gpt-5" {
-		t.Fatalf("expected LLM_MODEL default gpt-5, got %q", cfg.LLMModel)
+	if cfg.LLMModel != "openai/gpt-5.4-nano" {
+		t.Fatalf("expected LLM_MODEL default openai/gpt-5.4-nano, got %q", cfg.LLMModel)
 	}
 }
 
-func TestLoadConfig_AmveraRejectsNonGPT5Model(t *testing.T) {
+func TestLoadConfig_OpenRouterRejectsNonStrictModel(t *testing.T) {
 	setBaseEnv(t)
-	t.Setenv("LLM_PROVIDER", "amvera")
-	t.Setenv("LLM_API_KEY", "amv-key")
-	t.Setenv("LLM_MODEL", "gpt-4")
+	t.Setenv("LLM_PROVIDER", "openrouter")
+	t.Setenv("LLM_API_KEY", "or-key")
+	t.Setenv("LLM_MODEL", "openai/gpt-4o")
 
 	_, err := Load()
 	if err == nil {
-		t.Fatal("expected strict model policy error for amvera")
+		t.Fatal("expected strict model policy error for openrouter")
 	}
-	if !strings.Contains(err.Error(), "LLM_MODEL=gpt-5") {
+	if !strings.Contains(err.Error(), "LLM_MODEL=openai/gpt-5.4-nano") {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }

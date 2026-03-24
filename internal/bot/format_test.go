@@ -32,6 +32,7 @@ func TestFormatAvailabilityPreviewContainsConflictNames(t *testing.T) {
 	if !strings.Contains(out, "Алина") || !strings.Contains(out, "Иван") {
 		t.Fatalf("expected both conflict names in output, got %q", out)
 	}
+	assertStructuredSections(t, out)
 }
 
 func TestFormatBookingListPreviewSorted(t *testing.T) {
@@ -42,11 +43,39 @@ func TestFormatBookingListPreviewSorted(t *testing.T) {
 	}
 
 	out := FormatBookingListPreview(bookings, time.UTC)
-	lines := strings.Split(out, "\n")
-	if len(lines) < 2 {
-		t.Fatalf("expected at least 2 lines, got %q", out)
+	idxA := strings.Index(out, "А")
+	idxB := strings.Index(out, "Б")
+	if idxA == -1 || idxB == -1 {
+		t.Fatalf("expected both clients in output, got %q", out)
 	}
-	if !strings.Contains(lines[0], "А") {
-		t.Fatalf("expected sorted output, first line=%q", lines[0])
+	if idxA > idxB {
+		t.Fatalf("expected sorted output, got %q", out)
+	}
+	assertStructuredSections(t, out)
+}
+
+func TestFormatErrorStructured(t *testing.T) {
+	out := FormatError("upstream")
+	assertStructuredSections(t, out)
+	if !strings.Contains(strings.ToLower(out), "внешний сервис") {
+		t.Fatalf("expected upstream wording, got %q", out)
+	}
+}
+
+func TestFormatClarificationStructured(t *testing.T) {
+	out := FormatClarification("Уточни дату")
+	assertStructuredSections(t, out)
+	if !strings.Contains(out, "Уточни дату") {
+		t.Fatalf("expected question in clarification text, got %q", out)
+	}
+}
+
+func assertStructuredSections(t *testing.T, out string) {
+	t.Helper()
+	required := []string{"*Понял:*", "*Что сделаю:*", "*Действие:*", "*Что дальше:*"}
+	for _, section := range required {
+		if !strings.Contains(out, section) {
+			t.Fatalf("expected section %q in output: %q", section, out)
+		}
 	}
 }

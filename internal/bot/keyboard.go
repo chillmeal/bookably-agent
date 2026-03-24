@@ -101,14 +101,14 @@ func BuildPreviewKeyboard(planID string) InlineKeyboardMarkup {
 		InlineKeyboard: [][]InlineKeyboardButton{
 			{
 				{
-					Text:         "✅ Применить",
-					CallbackData: ConfirmData(planID),
-					Style:        buttonStyleSuccess,
-				},
-				{
 					Text:         "❌ Отменить",
 					CallbackData: CancelData(planID),
 					Style:        buttonStyleDanger,
+				},
+				{
+					Text:         "✅ Применить",
+					CallbackData: ConfirmData(planID),
+					Style:        buttonStyleSuccess,
 				},
 			},
 		},

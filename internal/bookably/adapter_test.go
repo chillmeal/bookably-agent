@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
+	"github.com/chillmeal/bookably-agent/internal/actorctx"
 	"github.com/chillmeal/bookably-agent/internal/domain"
 	"github.com/redis/go-redis/v9"
 )
@@ -20,19 +21,20 @@ import (
 func newTestAdapter(t *testing.T, serverURL string, cache redis.Cmdable) *Adapter {
 	t.Helper()
 
-	store := newMemoryTokenStore(map[string]*Token{
-		"spec-1": {AccessToken: "token", RefreshToken: "refresh"},
-	})
-	client, err := NewClient(serverURL, "spec-1", store, http.DefaultClient, 2*time.Second)
+	client, err := NewClient(serverURL, "bot-service-key", http.DefaultClient, 2*time.Second)
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
 
-	adapter, err := NewAdapter(client, "spec-1", cache, 5*time.Minute)
+	adapter, err := NewAdapter(client, cache, 5*time.Minute)
 	if err != nil {
 		t.Fatalf("NewAdapter: %v", err)
 	}
 	return adapter
+}
+
+func testActorContext() context.Context {
+	return actorctx.WithTelegramUserID(context.Background(), 123456789)
 }
 
 func TestGetBookingsPaginationAndMapping(t *testing.T) {
@@ -72,7 +74,7 @@ func TestGetBookingsPaginationAndMapping(t *testing.T) {
 	from := time.Date(2026, 3, 22, 0, 0, 0, 0, time.FixedZone("UTC+3", 3*3600))
 	to := from.Add(24 * time.Hour)
 
-	bookings, err := adapter.GetBookings(context.Background(), "spec-1", domain.BookingFilter{
+	bookings, err := adapter.GetBookings(testActorContext(), "spec-1", domain.BookingFilter{
 		From:      &from,
 		To:        &to,
 		Status:    "upcoming",
@@ -119,7 +121,7 @@ func TestFindSlotsAndNotFound(t *testing.T) {
 	adapter := newTestAdapter(t, server.URL, nil)
 	from := time.Date(2026, 3, 22, 9, 0, 0, 0, time.UTC)
 
-	slots, err := adapter.FindSlots(context.Background(), "spec-1", domain.SlotSearchRequest{
+	slots, err := adapter.FindSlots(testActorContext(), "spec-1", domain.SlotSearchRequest{
 		ServiceID:  "svc",
 		From:       from,
 		To:         from.Add(24 * time.Hour),
@@ -132,7 +134,7 @@ func TestFindSlotsAndNotFound(t *testing.T) {
 		t.Fatalf("expected 2 slots, got %d", len(slots))
 	}
 
-	_, err = adapter.FindSlots(context.Background(), "spec-1", domain.SlotSearchRequest{ServiceID: "missing", From: from, To: from.Add(time.Hour), MaxResults: 2})
+	_, err = adapter.FindSlots(testActorContext(), "spec-1", domain.SlotSearchRequest{ServiceID: "missing", From: from, To: from.Add(time.Hour), MaxResults: 2})
 	if err == nil {
 		t.Fatal("expected not found error")
 	}
@@ -165,7 +167,7 @@ func TestResolveServiceByNameAndCache(t *testing.T) {
 
 	adapter := newTestAdapter(t, server.URL, rdb)
 
-	svc, err := adapter.resolveServiceByName(context.Background(), "spec-1", "масс")
+	svc, err := adapter.resolveServiceByName(testActorContext(), "spec-1", "масс")
 	if err != nil {
 		t.Fatalf("resolve service масс: %v", err)
 	}
@@ -173,7 +175,7 @@ func TestResolveServiceByNameAndCache(t *testing.T) {
 		t.Fatalf("expected s1, got %s", svc.ID)
 	}
 
-	manicure, err := adapter.resolveServiceByName(context.Background(), "spec-1", "маникюр")
+	manicure, err := adapter.resolveServiceByName(testActorContext(), "spec-1", "маникюр")
 	if err != nil {
 		t.Fatalf("resolve service маникюр: %v", err)
 	}
@@ -181,12 +183,12 @@ func TestResolveServiceByNameAndCache(t *testing.T) {
 		t.Fatalf("expected s2, got %s", manicure.ID)
 	}
 
-	_, err = adapter.resolveServiceByName(context.Background(), "spec-1", "процедура")
+	_, err = adapter.resolveServiceByName(testActorContext(), "spec-1", "процедура")
 	if err == nil || !errors.Is(err, domain.ErrConflict) {
 		t.Fatalf("expected ErrConflict for ambiguous service, got %v", err)
 	}
 
-	_, err = adapter.resolveServiceByName(context.Background(), "spec-1", "xyz")
+	_, err = adapter.resolveServiceByName(testActorContext(), "spec-1", "xyz")
 	if err == nil || !errors.Is(err, domain.ErrNotFound) {
 		t.Fatalf("expected ErrNotFound for unknown service, got %v", err)
 	}
@@ -224,7 +226,7 @@ func TestPreviewAvailabilityChange_NoWriteCallsAndConflict(t *testing.T) {
 	defer server.Close()
 
 	adapter := newTestAdapter(t, server.URL, nil)
-	preview, err := adapter.PreviewAvailabilityChange(context.Background(), "spec-1", domain.ActionParams{
+	preview, err := adapter.PreviewAvailabilityChange(testActorContext(), "spec-1", domain.ActionParams{
 		DateRange: &domain.DateRange{From: "2026-03-24", To: "2026-03-24"},
 		TimeRange: &domain.TimeRange{From: "11:00", To: "12:00"},
 	})
@@ -271,7 +273,7 @@ func TestPreviewBookingCreate(t *testing.T) {
 	defer server.Close()
 
 	adapter := newTestAdapter(t, server.URL, nil)
-	preview, err := adapter.PreviewBookingCreate(context.Background(), "spec-1", domain.ActionParams{
+	preview, err := adapter.PreviewBookingCreate(testActorContext(), "spec-1", domain.ActionParams{
 		ServiceName: "Массаж",
 		NotBefore:   "2026-03-22T18:00:00",
 	})
@@ -299,7 +301,7 @@ func TestPreviewBookingCancelSingleMultipleAndNotFound(t *testing.T) {
 
 	adapter := newTestAdapter(t, server.URL, nil)
 
-	one, err := adapter.PreviewBookingCancel(context.Background(), "spec-1", domain.ActionParams{ClientName: "Иван"})
+	one, err := adapter.PreviewBookingCancel(testActorContext(), "spec-1", domain.ActionParams{ClientName: "Иван"})
 	if err != nil {
 		t.Fatalf("PreviewBookingCancel single: %v", err)
 	}
@@ -307,12 +309,12 @@ func TestPreviewBookingCancelSingleMultipleAndNotFound(t *testing.T) {
 		t.Fatalf("expected b1 result, got %+v", one.BookingResult)
 	}
 
-	_, err = adapter.PreviewBookingCancel(context.Background(), "spec-1", domain.ActionParams{ClientName: "Марина"})
+	_, err = adapter.PreviewBookingCancel(testActorContext(), "spec-1", domain.ActionParams{ClientName: "Марина"})
 	if err == nil || !errors.Is(err, domain.ErrConflict) {
 		t.Fatalf("expected ErrConflict for multiple matches, got %v", err)
 	}
 
-	_, err = adapter.PreviewBookingCancel(context.Background(), "spec-1", domain.ActionParams{ClientName: "Кирилл"})
+	_, err = adapter.PreviewBookingCancel(testActorContext(), "spec-1", domain.ActionParams{ClientName: "Кирилл"})
 	if err == nil || !errors.Is(err, domain.ErrNotFound) {
 		t.Fatalf("expected ErrNotFound for unknown client, got %v", err)
 	}
@@ -341,7 +343,7 @@ func TestGetBookingsQueryContainsUTCAndPaginationCursor(t *testing.T) {
 	from := time.Date(2026, 3, 22, 12, 0, 0, 0, time.FixedZone("UTC+3", 3*3600))
 	to := from.Add(4 * time.Hour)
 
-	_, err := adapter.GetBookings(context.Background(), "spec-1", domain.BookingFilter{From: &from, To: &to, Status: "upcoming", Limit: 50})
+	_, err := adapter.GetBookings(testActorContext(), "spec-1", domain.BookingFilter{From: &from, To: &to, Status: "upcoming", Limit: 50})
 	if err != nil {
 		t.Fatalf("GetBookings: %v", err)
 	}
@@ -371,7 +373,7 @@ func TestPreviewAvailabilityChangeEmptyRange(t *testing.T) {
 	defer server.Close()
 
 	adapter := newTestAdapter(t, server.URL, nil)
-	preview, err := adapter.PreviewAvailabilityChange(context.Background(), "spec-1", domain.ActionParams{
+	preview, err := adapter.PreviewAvailabilityChange(testActorContext(), "spec-1", domain.ActionParams{
 		DateRange: &domain.DateRange{From: "2026-03-24", To: "2026-03-24"},
 		TimeRange: &domain.TimeRange{From: "10:00", To: "11:00"},
 	})
@@ -417,7 +419,7 @@ func TestGetProviderInfo_ReturnsMeError(t *testing.T) {
 	defer server.Close()
 
 	adapter := newTestAdapter(t, server.URL, nil)
-	_, err := adapter.GetProviderInfo(context.Background(), "spec-1")
+	_, err := adapter.GetProviderInfo(testActorContext(), "spec-1")
 	if err == nil {
 		t.Fatal("expected error from /me")
 	}
@@ -445,7 +447,7 @@ func TestGetProviderInfo_UsesSpecialistProfileTimezone(t *testing.T) {
 	defer server.Close()
 
 	adapter := newTestAdapter(t, server.URL, nil)
-	info, err := adapter.GetProviderInfo(context.Background(), "spec-1")
+	info, err := adapter.GetProviderInfo(testActorContext(), "spec-1")
 	if err != nil {
 		t.Fatalf("GetProviderInfo: %v", err)
 	}
@@ -473,11 +475,32 @@ func TestGetProviderInfo_EmptyTimezoneReturnsValidation(t *testing.T) {
 	defer server.Close()
 
 	adapter := newTestAdapter(t, server.URL, nil)
-	_, err := adapter.GetProviderInfo(context.Background(), "spec-1")
+	_, err := adapter.GetProviderInfo(testActorContext(), "spec-1")
 	if err == nil {
 		t.Fatal("expected validation error when timezone is empty")
 	}
 	if !errors.Is(err, domain.ErrValidation) {
 		t.Fatalf("expected ErrValidation, got %v", err)
+	}
+}
+
+func TestGetProviderInfo_NonSpecialistReturnsForbidden(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case endpointMe:
+			_, _ = io.WriteString(w, `{"actor":{"role":"CLIENT","specialistId":null}}`)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	adapter := newTestAdapter(t, server.URL, nil)
+	_, err := adapter.GetProviderInfo(testActorContext(), "")
+	if err == nil {
+		t.Fatal("expected forbidden error for non-specialist actor")
+	}
+	if !errors.Is(err, domain.ErrForbidden) {
+		t.Fatalf("expected ErrForbidden, got %v", err)
 	}
 }

@@ -10,6 +10,17 @@ Live document - update status and check off criteria as work progresses.
 This file is the canonical live status tracker for implementation progress.  
 `ENGINEERING_PLAN.md` is maintained in parallel as an execution log and mirrored ticket-state ledger.
 
+## Latest update (2026-03-24)
+
+- Iteration 17 stabilization pass completed (`DONE`) as runtime hardening over existing phases.
+- ACP deploy contour switched to always-on in agent compose (`agent + redis + acp + postgres`), so `ACP_BASE_URL=http://acp:8080` is stable by default.
+- OpenRouter SSE parser fixed for token spacing and multi-line `data:` events.
+- Handler streaming moved to hybrid mode (SSE progress + heartbeat draft updates every ~2s).
+- Large availability impact (`>20`) changed from hard deep-link block to recommendation-only (confirm remains available in chat).
+- `editMessageReplyMarkup ... message is not modified` treated as idempotent success (no noisy flow break).
+- User-facing formatter unified to structured sections: `Понял` / `Что сделаю` / `Действие` / `Что дальше`.
+- Runtime limitations unchanged: `P2-05` remains `IN PROGRESS` (live suite pending controlled budget), `create_booking` confirm execution remains contract-blocked.
+
 ## Status legend
 
 | Status | Meaning |
@@ -983,6 +994,46 @@ Acceptance criteria:
 - Live classifier attempt executed with `amvera/gpt-5`, but acceptance gate is still blocked by provider billing (`402` / run out of tokens), so:
   - `P2-05` stays `IN PROGRESS`;
   - no fallback provider/model was introduced.
+
+## Iteration 14 note (Auth loop fix + one-time login UX, 2026-03-24)
+
+- `bookably-agent` auth/session flow hardened without LLM spend:
+  - unauthenticated message path now persists session state and enforces one-time login prompt cooldown (`LastAuthPromptAt`, 10 minutes);
+  - if `session.ProviderID` is empty, handler attempts token-based auto-restore for `BOOKABLY_SPECIALIST_ID` before showing login button;
+  - `SpecialistTokenStore` bot seam now supports token presence checks via `HasToken(...)`.
+- Auth observability expanded (redacted structured events):
+  - `auth.prompt_sent`, `auth.auto_restored`, `auth.web_app_data_received`, `auth.web_app_data_invalid`, `auth.specialist_mismatch`, `auth.blocked_no_payload`.
+- `booking-backend/apps/web` `mode=bot_auth` UX no longer silent:
+  - explicit status screen for `sent` (`Вход выполнен, можно вернуться в чат`);
+  - explicit status screen for `blocked_not_tma` (open from Telegram);
+  - explicit status screen for `blocked_no_payload` (active specialist profile required), with return CTA.
+- Validation performed with no external LLM calls:
+  - `go test ./internal/bot/... -v`
+  - `go test ./internal/session/... -v`
+  - `go test ./tests/... -tags=integration -v`
+  - `go test ./...`, `go vet ./...`, `go build ./...`
+  - `npm --prefix apps/web test -- --run tests/bot-auth-bridge.test.ts`
+  - `npm --prefix apps/web run build`
+
+## Iteration 15 note (Service-key bot auth cutover, 2026-03-24)
+
+- Backend auth surface switched to dual mode on existing `/api/v1/*` routes:
+  - JWT bearer remains supported;
+  - bot server-to-server headers are now supported as alternative:
+    - `X-Bot-Service-Key`
+    - `X-Telegram-User-Id`.
+- Agent runtime auth hard-cut to service-key mode:
+  - removed runtime login prompt flow and `web_app_data` handshake from bot handler;
+  - removed JWT token-store/refresh runtime dependencies from Bookably client and ACP executor;
+  - every Bookably/ACP write/read call now carries bot auth headers derived from session `telegram_user_id`.
+- Session contract updated:
+  - `telegram_user_id` persisted as first-class field in `ba:session:{chat_id}`;
+  - provider hydration is now driven by Telegram `from.id` actor context.
+- Mini App cleanup completed:
+  - removed `mode=bot_auth` bridge runtime and related test/module wiring.
+- Runtime policy unchanged:
+  - `create_booking` execution remains contract-blocked (deep-link fallback);
+  - availability writes remain strict-real via commit payload.
 
 Update `status` fields and checkboxes as tasks are completed.  
 Blocked count is now zero in backlog status; backend create-booking contract gap is tracked as a runtime limitation note.

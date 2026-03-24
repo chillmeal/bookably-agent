@@ -13,8 +13,9 @@ import (
 )
 
 type mockLLMClient struct {
-	completeFn func(ctx context.Context, messages []llm.Message) (*llm.Completion, error)
-	messages   []llm.Message
+	completeFn       func(ctx context.Context, messages []llm.Message) (*llm.Completion, error)
+	completeStreamFn func(ctx context.Context, messages []llm.Message, onProgress func(llm.StreamProgress)) (*llm.Completion, error)
+	messages         []llm.Message
 }
 
 func (m *mockLLMClient) Complete(ctx context.Context, messages []llm.Message) (*llm.Completion, error) {
@@ -23,6 +24,17 @@ func (m *mockLLMClient) Complete(ctx context.Context, messages []llm.Message) (*
 		return nil, errors.New("mock llm: completeFn is nil")
 	}
 	return m.completeFn(ctx, messages)
+}
+
+func (m *mockLLMClient) CompleteStream(ctx context.Context, messages []llm.Message, onProgress func(llm.StreamProgress)) (*llm.Completion, error) {
+	m.messages = append([]llm.Message(nil), messages...)
+	if m.completeStreamFn == nil {
+		if m.completeFn != nil {
+			return m.completeFn(ctx, messages)
+		}
+		return nil, errors.New("mock llm: completeStreamFn is nil")
+	}
+	return m.completeStreamFn(ctx, messages, onProgress)
 }
 
 func TestInterpreter_InterpretSuccess(t *testing.T) {
@@ -146,6 +158,42 @@ func TestInterpreter_InterpretParserFallbackToUnknown(t *testing.T) {
 	}
 	if plan.Intent != IntentUnknown {
 		t.Fatalf("expected unknown intent, got %q", plan.Intent)
+	}
+}
+
+func TestInterpreter_InterpretWithProgressStreamingPath(t *testing.T) {
+	promptPath := createPromptFile(t, "stub {{TODAY_DATE}}")
+	mock := &mockLLMClient{
+		completeFn: func(ctx context.Context, messages []llm.Message) (*llm.Completion, error) {
+			t.Fatal("Complete must not be called in streaming path")
+			return nil, nil
+		},
+		completeStreamFn: func(ctx context.Context, messages []llm.Message, onProgress func(llm.StreamProgress)) (*llm.Completion, error) {
+			onProgress(llm.StreamProgress{ChunkCount: 1, Bytes: 8, StartedAt: time.Now(), UpdatedAt: time.Now()})
+			onProgress(llm.StreamProgress{ChunkCount: 2, Bytes: 16, StartedAt: time.Now(), UpdatedAt: time.Now()})
+			return &llm.Completion{
+				Content: `{"intent":"list_bookings","confidence":0.93,"params":{"status":"upcoming"}}`,
+			}, nil
+		},
+	}
+
+	interp, err := New(mock, promptPath, time.Second)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	var progressCalls int
+	plan, err := interp.InterpretWithProgress(context.Background(), "Покажи записи", ConversationContext{Timezone: "Europe/Berlin"}, func(p Progress) {
+		progressCalls++
+	})
+	if err != nil {
+		t.Fatalf("InterpretWithProgress: %v", err)
+	}
+	if plan.Intent != IntentListBookings {
+		t.Fatalf("expected list_bookings, got %q", plan.Intent)
+	}
+	if progressCalls < 2 {
+		t.Fatalf("expected progress callback to be called, got %d", progressCalls)
 	}
 }
 

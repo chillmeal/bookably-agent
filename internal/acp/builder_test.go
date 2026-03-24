@@ -13,7 +13,7 @@ func TestBuildCancelBookingRunShape(t *testing.T) {
 		RawMessage:   "Отмени запись",
 	}
 
-	run, err := BuildCancelBookingRun("https://api.bookably.app", "token-1", "book-42", "idem-1", meta)
+	run, err := BuildCancelBookingRun("https://api.bookably.app", "svc-key", 123456789, "book-42", "idem-1", meta)
 	if err != nil {
 		t.Fatalf("BuildCancelBookingRun: %v", err)
 	}
@@ -35,8 +35,11 @@ func TestBuildCancelBookingRunShape(t *testing.T) {
 	if step.Config.URL != "https://api.bookably.app/api/v1/specialist/bookings/book-42/cancel" {
 		t.Fatalf("url mismatch: %q", step.Config.URL)
 	}
-	if step.Config.Headers["Authorization"] != "Bearer token-1" {
-		t.Fatalf("authorization header mismatch: %q", step.Config.Headers["Authorization"])
+	if step.Config.Headers["X-Bot-Service-Key"] != "svc-key" {
+		t.Fatalf("service key header mismatch: %q", step.Config.Headers["X-Bot-Service-Key"])
+	}
+	if step.Config.Headers["X-Telegram-User-Id"] != "123456789" {
+		t.Fatalf("telegram user id header mismatch: %q", step.Config.Headers["X-Telegram-User-Id"])
 	}
 	if step.Config.Headers["Idempotency-Key"] != "idem-1" {
 		t.Fatalf("idempotency header mismatch: %q", step.Config.Headers["Idempotency-Key"])
@@ -56,7 +59,7 @@ func TestBuildCreateBookingRunShape(t *testing.T) {
 		RawMessage:   "Запиши Алину",
 	}
 
-	run, err := BuildCreateBookingRun("https://api.bookably.app/", "token-2", "svc-1", "slot-7", "idem-2", meta)
+	run, err := BuildCreateBookingRun("https://api.bookably.app/", "svc-key-2", 987654321, "svc-1", "slot-7", "idem-2", meta)
 	if err != nil {
 		t.Fatalf("BuildCreateBookingRun: %v", err)
 	}
@@ -74,8 +77,11 @@ func TestBuildCreateBookingRunShape(t *testing.T) {
 	if step.Config.URL != "https://api.bookably.app/api/v1/public/bookings" {
 		t.Fatalf("url mismatch: %q", step.Config.URL)
 	}
-	if step.Config.Headers["Authorization"] != "Bearer token-2" {
-		t.Fatalf("authorization header mismatch: %q", step.Config.Headers["Authorization"])
+	if step.Config.Headers["X-Bot-Service-Key"] != "svc-key-2" {
+		t.Fatalf("service key header mismatch: %q", step.Config.Headers["X-Bot-Service-Key"])
+	}
+	if step.Config.Headers["X-Telegram-User-Id"] != "987654321" {
+		t.Fatalf("telegram user id header mismatch: %q", step.Config.Headers["X-Telegram-User-Id"])
 	}
 	if step.Config.Headers["Idempotency-Key"] != "idem-2" {
 		t.Fatalf("idempotency header mismatch: %q", step.Config.Headers["Idempotency-Key"])
@@ -103,7 +109,7 @@ func TestBuildAvailabilityRunWithThreeSlots(t *testing.T) {
 		RawMessage:   "Закрой диапазон",
 	}
 
-	run, err := BuildAvailabilityRun("https://api.bookably.app", "token-3", create, deleteIDs, "idem-base", meta)
+	run, err := BuildAvailabilityRun("https://api.bookably.app", "svc-key-3", 555000111, create, deleteIDs, "idem-base", meta)
 	if err != nil {
 		t.Fatalf("BuildAvailabilityRun: %v", err)
 	}
@@ -120,6 +126,12 @@ func TestBuildAvailabilityRunWithThreeSlots(t *testing.T) {
 	}
 	if commit.Config.Headers["Idempotency-Key"] != "idem-base:commit" {
 		t.Fatalf("commit idempotency key mismatch: %q", commit.Config.Headers["Idempotency-Key"])
+	}
+	if commit.Config.Headers["X-Bot-Service-Key"] != "svc-key-3" {
+		t.Fatalf("service key mismatch: %q", commit.Config.Headers["X-Bot-Service-Key"])
+	}
+	if commit.Config.Headers["X-Telegram-User-Id"] != "555000111" {
+		t.Fatalf("telegram user id mismatch: %q", commit.Config.Headers["X-Telegram-User-Id"])
 	}
 
 	body, ok := commit.Config.Body.(CommitScheduleBody)

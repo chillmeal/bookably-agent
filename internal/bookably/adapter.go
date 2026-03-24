@@ -26,23 +26,19 @@ const (
 var errNoBreakWindows = errors.New("bookably adapter: no breaks provided")
 
 type Adapter struct {
-	client       *Client
-	cache        redis.Cmdable
-	prefsTTL     time.Duration
-	specialistID string
+	client   *Client
+	cache    redis.Cmdable
+	prefsTTL time.Duration
 }
 
-func NewAdapter(client *Client, specialistID string, cache redis.Cmdable, prefsTTL time.Duration) (*Adapter, error) {
+func NewAdapter(client *Client, cache redis.Cmdable, prefsTTL time.Duration) (*Adapter, error) {
 	if client == nil {
 		return nil, errors.New("bookably adapter: client is nil")
-	}
-	if strings.TrimSpace(specialistID) == "" {
-		return nil, errors.New("bookably adapter: specialist id is required")
 	}
 	if prefsTTL <= 0 {
 		prefsTTL = defaultPrefsCacheTTL
 	}
-	return &Adapter{client: client, cache: cache, prefsTTL: prefsTTL, specialistID: specialistID}, nil
+	return &Adapter{client: client, cache: cache, prefsTTL: prefsTTL}, nil
 }
 
 type apiBooking struct {
@@ -240,11 +236,14 @@ func (a *Adapter) GetProviderInfo(ctx context.Context, providerID string) (*doma
 	if err := a.client.GetJSON(ctx, endpointMe, nil, &me); err != nil {
 		return nil, err
 	}
+	if !strings.EqualFold(strings.TrimSpace(me.Actor.Role), "SPECIALIST") {
+		return nil, errors.Join(domain.ErrForbidden, errors.New("bookably adapter: actor is not specialist"))
+	}
 	if strings.TrimSpace(me.Actor.SpecialistID) != "" {
 		resolvedProviderID = me.Actor.SpecialistID
 	}
 	if strings.TrimSpace(resolvedProviderID) == "" {
-		return nil, errors.Join(domain.ErrValidation, errors.New("bookably adapter: specialist id is required"))
+		return nil, errors.Join(domain.ErrForbidden, errors.New("bookably adapter: specialist actor has no specialist id"))
 	}
 
 	services, err := a.listServices(ctx, resolvedProviderID)
@@ -467,10 +466,7 @@ func (a *Adapter) PreviewBookingCancel(ctx context.Context, providerID string, p
 }
 
 func (a *Adapter) resolveProviderID(providerID string) string {
-	if strings.TrimSpace(providerID) != "" {
-		return strings.TrimSpace(providerID)
-	}
-	return a.specialistID
+	return strings.TrimSpace(providerID)
 }
 
 func (a *Adapter) listServices(ctx context.Context, providerID string) ([]domain.Service, error) {

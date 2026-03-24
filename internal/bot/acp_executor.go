@@ -18,31 +18,27 @@ type ACPRunSubmitter interface {
 	SubmitAndWait(ctx context.Context, run acp.ACPRun) (*acp.ACPRunResult, error)
 }
 
-type AccessTokenProvider interface {
-	GetAccessToken(ctx context.Context, specialistID string) (string, error)
-}
-
 type RuntimeACPExecutor struct {
 	bookablyBaseURL string
+	botServiceKey   string
 	runner          ACPRunSubmitter
-	tokenProvider   AccessTokenProvider
 	logger          *observability.Logger
 }
 
-func NewRuntimeACPExecutor(bookablyBaseURL string, runner ACPRunSubmitter, tokenProvider AccessTokenProvider) (*RuntimeACPExecutor, error) {
+func NewRuntimeACPExecutor(bookablyBaseURL, botServiceKey string, runner ACPRunSubmitter) (*RuntimeACPExecutor, error) {
 	if strings.TrimSpace(bookablyBaseURL) == "" {
 		return nil, errors.New("bot acp executor: bookably base url is required")
+	}
+	if strings.TrimSpace(botServiceKey) == "" {
+		return nil, errors.New("bot acp executor: bot service key is required")
 	}
 	if runner == nil {
 		return nil, errors.New("bot acp executor: runner is nil")
 	}
-	if tokenProvider == nil {
-		return nil, errors.New("bot acp executor: token provider is nil")
-	}
 	return &RuntimeACPExecutor{
 		bookablyBaseURL: strings.TrimRight(strings.TrimSpace(bookablyBaseURL), "/"),
+		botServiceKey:   strings.TrimSpace(botServiceKey),
 		runner:          runner,
-		tokenProvider:   tokenProvider,
 		logger:          observability.NewLogger(nil),
 	}, nil
 }
@@ -67,14 +63,11 @@ func (e *RuntimeACPExecutor) ExecuteConfirmed(ctx context.Context, s *session.Se
 	if strings.TrimSpace(s.ProviderID) == "" {
 		return nil, errors.Join(domain.ErrValidation, errors.New("bot acp executor: provider_id is required"))
 	}
-
-	started := time.Now()
-	accessToken, err := e.tokenProvider.GetAccessToken(ctx, s.ProviderID)
-	if err != nil {
-		e.logError(s, pending, started, "ErrUnauthorized", err, map[string]any{"stage": "token_provider"})
-		return nil, err
+	if s.TelegramUserID <= 0 {
+		return nil, errors.Join(domain.ErrValidation, errors.New("bot acp executor: telegram_user_id is required"))
 	}
 
+	started := time.Now()
 	meta := acp.RunMetadata{
 		ChatID:       fmt.Sprintf("%d", s.ChatID),
 		SpecialistID: strings.TrimSpace(s.ProviderID),
@@ -83,7 +76,7 @@ func (e *RuntimeACPExecutor) ExecuteConfirmed(ctx context.Context, s *session.Se
 		RawMessage:   strings.TrimSpace(pending.Plan.RawUserMessage),
 	}
 
-	run, err := e.buildRun(accessToken, pending, meta, s.Timezone)
+	run, err := e.buildRun(s.TelegramUserID, pending, meta, s.Timezone)
 	if err != nil {
 		errType := "ErrValidation"
 		if errors.Is(err, ErrExecutionContractBlocked) {
@@ -159,14 +152,14 @@ func classifyExecutionErrorType(err error) string {
 	}
 }
 
-func (e *RuntimeACPExecutor) buildRun(accessToken string, pending *session.PendingPlan, meta acp.RunMetadata, timezone string) (*acp.ACPRun, error) {
+func (e *RuntimeACPExecutor) buildRun(telegramUserID int64, pending *session.PendingPlan, meta acp.RunMetadata, timezone string) (*acp.ACPRun, error) {
 	switch pending.Plan.Intent {
 	case interpreter.IntentCancelBooking:
 		bookingID := strings.TrimSpace(pending.Plan.Params.BookingID)
 		if bookingID == "" {
 			return nil, errors.Join(domain.ErrValidation, errors.New("bot acp executor: booking_id is required for cancel"))
 		}
-		return acp.BuildCancelBookingRun(e.bookablyBaseURL, accessToken, bookingID, pending.IdempotencyKey, meta)
+		return acp.BuildCancelBookingRun(e.bookablyBaseURL, e.botServiceKey, telegramUserID, bookingID, pending.IdempotencyKey, meta)
 	case interpreter.IntentCreateBooking:
 		return nil, errors.Join(
 			ErrExecutionContractBlocked,
@@ -177,7 +170,7 @@ func (e *RuntimeACPExecutor) buildRun(accessToken string, pending *session.Pendi
 		if err != nil {
 			return nil, err
 		}
-		return acp.BuildAvailabilityRun(e.bookablyBaseURL, accessToken, create, deleteIDs, pending.IdempotencyKey, meta)
+		return acp.BuildAvailabilityRun(e.bookablyBaseURL, e.botServiceKey, telegramUserID, create, deleteIDs, pending.IdempotencyKey, meta)
 	default:
 		return nil, errors.Join(domain.ErrValidation, fmt.Errorf("bot acp executor: unsupported intent %q", pending.Plan.Intent))
 	}
@@ -246,10 +239,10 @@ func riskFromIntent(intent interpreter.Intent) string {
 func successMessageForIntent(intent interpreter.Intent) string {
 	switch intent {
 	case interpreter.IntentCancelBooking:
-		return "Запись отменена\\."
+		return "Запись отменена."
 	case interpreter.IntentCreateBooking:
-		return "Запись создана\\."
+		return "Запись создана."
 	default:
-		return "Готово\\. Изменения применены\\."
+		return "Готово. Изменения применены."
 	}
 }

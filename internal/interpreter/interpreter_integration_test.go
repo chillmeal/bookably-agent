@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -34,12 +35,13 @@ func TestClassifier(t *testing.T) {
 		t.Skipf("integration test skipped: %v", err)
 	}
 
-	client, err := newIntegrationLLMClient(provider, apiKey, strings.TrimSpace(os.Getenv("LLM_MODEL")))
+	interpTimeout := loadIntegrationTimeout()
+	client, err := newIntegrationLLMClient(provider, apiKey, strings.TrimSpace(os.Getenv("LLM_MODEL")), interpTimeout)
 	if err != nil {
 		t.Fatalf("build llm client: %v", err)
 	}
 
-	interp, err := New(client, promptPath, 15*time.Second)
+	interp, err := New(client, promptPath, interpTimeout)
 	if err != nil {
 		t.Fatalf("new interpreter: %v", err)
 	}
@@ -99,7 +101,9 @@ func TestClassifier(t *testing.T) {
 	for _, tc := range cases {
 		tc := tc
 		t.Run(fmt.Sprintf("case_%02d", tc.id), func(t *testing.T) {
-			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			// Keep per-case context longer than interpreter timeout so the harness
+			// does not cut requests prematurely under variable provider latency.
+			ctx, cancel := context.WithTimeout(context.Background(), interpTimeout+10*time.Second)
 			defer cancel()
 
 			plan, err := interp.Interpret(ctx, tc.input, ConversationContext{
@@ -126,16 +130,24 @@ func TestClassifier(t *testing.T) {
 	}
 }
 
-func newIntegrationLLMClient(provider, apiKey, model string) (llm.LLMClient, error) {
-	opts := llm.ClientOptions{Model: model, Timeout: 15 * time.Second}
+func loadIntegrationTimeout() time.Duration {
+	raw := strings.TrimSpace(os.Getenv("LLM_INTEGRATION_TIMEOUT_SEC"))
+	if raw == "" {
+		return 40 * time.Second
+	}
+	sec, err := strconv.Atoi(raw)
+	if err != nil || sec <= 0 {
+		return 40 * time.Second
+	}
+	return time.Duration(sec) * time.Second
+}
+
+func newIntegrationLLMClient(provider, apiKey, model string, timeout time.Duration) (llm.LLMClient, error) {
+	opts := llm.ClientOptions{Model: model, Timeout: timeout}
 
 	switch provider {
-	case "anthropic":
-		return llm.NewAnthropicClient(apiKey, opts)
-	case "openai":
-		return llm.NewOpenAIClient(apiKey, opts)
-	case "amvera":
-		return llm.NewAmveraClient(apiKey, opts)
+	case "openrouter":
+		return llm.NewOpenRouterClient(apiKey, opts)
 	default:
 		return nil, fmt.Errorf("unsupported LLM_PROVIDER %q", provider)
 	}

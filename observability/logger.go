@@ -33,13 +33,21 @@ func NewLogger(out io.Writer) *Logger {
 }
 
 func (l *Logger) LogError(entry Entry) {
+	l.log("error", entry)
+}
+
+func (l *Logger) LogInfo(entry Entry) {
+	l.log("info", entry)
+}
+
+func (l *Logger) log(level string, entry Entry) {
 	if l == nil || l.out == nil {
 		return
 	}
 
 	payload := map[string]any{
 		"ts":          time.Now().UTC().Format(time.RFC3339Nano),
-		"level":       "error",
+		"level":       strings.TrimSpace(level),
 		"trace_id":    strings.TrimSpace(entry.TraceID),
 		"chat_id":     entry.ChatID,
 		"intent":      strings.TrimSpace(entry.Intent),
@@ -67,4 +75,3 @@ func (l *Logger) LogError(entry Entry) {
 	defer l.mu.Unlock()
 	_, _ = l.out.Write(append(encoded, '\n'))
 }
-

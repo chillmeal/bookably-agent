@@ -144,24 +144,6 @@ func (m *runSubmitterMock) SubmitAndWait(ctx context.Context, run acp.ACPRun) (*
 	return &acp.ACPRunResult{RunID: "run-1", Status: acp.ACPStatusCompleted}, nil
 }
 
-type tokenProviderMock struct {
-	token string
-	err   error
-}
-
-func (m *tokenProviderMock) GetAccessToken(ctx context.Context, specialistID string) (string, error) {
-	if m.err != nil {
-		return "", m.err
-	}
-	return m.token, nil
-}
-
-type noopSpecialistTokenStore struct{}
-
-func (noopSpecialistTokenStore) SaveToken(ctx context.Context, specialistID string, token bot.AuthToken) error {
-	return nil
-}
-
 type telegramMessageCall struct {
 	ChatID   int64
 	Text     string
@@ -325,18 +307,20 @@ func sendWebhook(t *testing.T, handler *bot.Handler, body []byte) *httptest.Resp
 	req.Header.Set("X-Telegram-Bot-Api-Secret-Token", "secret")
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
+	if !handler.WaitForIdle(5 * time.Second) {
+		t.Fatal("timeout waiting handler background worker")
+	}
 	return rec
 }
 
 func buildHandler(t *testing.T, store session.SessionStore, interp bot.InterpreterService, provider domain.Provider, executor bot.ACPExecutor, tg bot.TelegramGateway) *bot.Handler {
 	t.Helper()
 	h, err := bot.NewHandler(bot.HandlerConfig{
-		WebhookSecret:     "secret",
-		WebhookURL:        "https://example.test/webhook",
-		MiniAppURL:        "https://mini.app/open",
-		DefaultProviderID: "spec-1",
-		PlanTTL:           15 * time.Minute,
-	}, store, interp, provider, executor, noopSpecialistTokenStore{}, tg)
+		WebhookSecret: "secret",
+		WebhookURL:    "https://example.test/webhook",
+		MiniAppURL:    "https://mini.app/open",
+		PlanTTL:       15 * time.Minute,
+	}, store, interp, provider, executor, tg)
 	if err != nil {
 		t.Fatalf("NewHandler: %v", err)
 	}
@@ -345,7 +329,7 @@ func buildHandler(t *testing.T, store session.SessionStore, interp bot.Interpret
 
 func newRuntimeExecutor(t *testing.T, runner *runSubmitterMock) *bot.RuntimeACPExecutor {
 	t.Helper()
-	executor, err := bot.NewRuntimeACPExecutor("https://bookably.test", runner, &tokenProviderMock{token: "access-token"})
+	executor, err := bot.NewRuntimeACPExecutor("https://bookably.test", "bot-service-key", runner)
 	if err != nil {
 		t.Fatalf("NewRuntimeACPExecutor: %v", err)
 	}

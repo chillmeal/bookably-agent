@@ -23,13 +23,15 @@ type PendingPlan struct {
 }
 
 type Session struct {
-	ChatID             int64        `json:"chat_id"`
-	ProviderID         string       `json:"provider_id"`
-	Timezone           string       `json:"timezone"`
-	ClarificationCount int          `json:"clarification_count"`
-	PendingPlan        *PendingPlan `json:"pending_plan,omitempty"`
-	DialogHistory      []Message    `json:"dialog_history"`
-	UpdatedAt          time.Time    `json:"updated_at"`
+	ChatID                int64        `json:"chat_id"`
+	TelegramUserID        int64        `json:"telegram_user_id,omitempty"`
+	LastProcessedUpdateID int64        `json:"last_processed_update_id,omitempty"`
+	ProviderID            string       `json:"provider_id"`
+	Timezone              string       `json:"timezone"`
+	ClarificationCount    int          `json:"clarification_count"`
+	PendingPlan           *PendingPlan `json:"pending_plan,omitempty"`
+	DialogHistory         []Message    `json:"dialog_history"`
+	UpdatedAt             time.Time    `json:"updated_at"`
 }
 
 type PendingSlotCandidate struct {

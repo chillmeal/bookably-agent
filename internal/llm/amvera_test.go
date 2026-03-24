@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"strings"
 	"testing"
 	"time"
@@ -215,5 +217,46 @@ func TestAmveraStrictModelPolicy(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "strict model policy") {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestAmveraRetriesOnTLSHandshakeTimeout(t *testing.T) {
+	var attempts int32
+	httpClient := &http.Client{
+		Transport: roundTripperFunc(func(_ *http.Request) (*http.Response, error) {
+			n := atomic.AddInt32(&attempts, 1)
+			if n == 1 {
+				return nil, &net.OpError{Op: "dial", Err: errors.New("TLS handshake timeout")}
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body: io.NopCloser(strings.NewReader(`{
+					"choices":[{"message":{"role":"assistant","text":"{\"intent\":\"unknown\"}"}}],
+					"usage":{"prompt_tokens":1,"completion_tokens":1}
+				}`)),
+			}, nil
+		}),
+	}
+
+	client, err := NewAmveraClient("test-key", ClientOptions{
+		Model:      "gpt-5",
+		Timeout:    time.Second,
+		BaseURL:    "http://amvera.test/api/v1",
+		HTTPClient: httpClient,
+	})
+	if err != nil {
+		t.Fatalf("NewAmveraClient() unexpected error: %v", err)
+	}
+
+	out, err := client.Complete(context.Background(), []Message{{Role: "user", Content: "привет"}})
+	if err != nil {
+		t.Fatalf("Complete() unexpected error: %v", err)
+	}
+	if out == nil || strings.TrimSpace(out.Content) == "" {
+		t.Fatalf("expected non-empty completion, got: %+v", out)
+	}
+	if got := atomic.LoadInt32(&attempts); got != 2 {
+		t.Fatalf("expected 2 attempts, got %d", got)
 	}
 }

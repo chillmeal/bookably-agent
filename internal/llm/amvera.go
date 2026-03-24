@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -57,9 +58,11 @@ func NewAmveraClient(apiKey string, opts ClientOptions) (*AmveraClient, error) {
 		return nil, fmt.Errorf("amvera: strict model policy requires %q, got %q", defaultAmveraModel, model)
 	}
 
+	timeout := normalizeTimeout(opts.Timeout)
+
 	httpClient := opts.HTTPClient
 	if httpClient == nil {
-		httpClient = &http.Client{}
+		httpClient = newDefaultLLMHTTPClient(timeout)
 	}
 
 	return &AmveraClient{
@@ -67,7 +70,7 @@ func NewAmveraClient(apiKey string, opts ClientOptions) (*AmveraClient, error) {
 		baseURL:    baseURL,
 		apiKey:     strings.TrimSpace(apiKey),
 		model:      model,
-		timeout:    normalizeTimeout(opts.Timeout),
+		timeout:    timeout,
 	}, nil
 }
 
@@ -111,32 +114,57 @@ func (c *AmveraClient) Complete(ctx context.Context, messages []Message) (*Compl
 	callCtx, cancel := context.WithTimeout(ctx, c.timeout)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(callCtx, http.MethodPost, c.baseURL+"/models/gpt", bytes.NewReader(body))
-	if err != nil {
-		return nil, fmt.Errorf("amvera: build request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Auth-Token", "Bearer "+c.apiKey)
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		if errors.Is(err, context.DeadlineExceeded) {
-			return nil, fmt.Errorf("amvera: timeout: %w", err)
+	doRequest := func() (int, []byte, error) {
+		req, reqErr := http.NewRequestWithContext(callCtx, http.MethodPost, c.baseURL+"/models/gpt", bytes.NewReader(body))
+		if reqErr != nil {
+			return 0, nil, fmt.Errorf("amvera: build request: %w", reqErr)
 		}
-		if errors.Is(err, context.Canceled) {
-			return nil, fmt.Errorf("amvera: canceled: %w", err)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Auth-Token", "Bearer "+c.apiKey)
+
+		resp, reqErr := c.httpClient.Do(req)
+		if reqErr != nil {
+			return 0, nil, reqErr
 		}
-		return nil, fmt.Errorf("amvera: request failed: %w", err)
-	}
-	defer resp.Body.Close()
+		defer resp.Body.Close()
 
-	raw, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("amvera: read response: %w", err)
+		raw, readErr := io.ReadAll(resp.Body)
+		if readErr != nil {
+			return 0, nil, fmt.Errorf("amvera: read response: %w", readErr)
+		}
+		return resp.StatusCode, raw, nil
 	}
 
-	if resp.StatusCode != http.StatusOK {
-		return nil, c.mapNonOK(resp.StatusCode, raw)
+	var (
+		status int
+		raw    []byte
+		reqErr error
+	)
+	for attempt := 0; attempt < 2; attempt++ {
+		status, raw, reqErr = doRequest()
+		if reqErr == nil {
+			break
+		}
+		if attempt == 0 && isRetryableTransportError(reqErr) {
+			if waitErr := waitRetry(callCtx, 450*time.Millisecond); waitErr != nil {
+				return nil, fmt.Errorf("amvera: timeout: %w", waitErr)
+			}
+			continue
+		}
+		if errors.Is(reqErr, context.DeadlineExceeded) {
+			return nil, fmt.Errorf("amvera: timeout: %w", reqErr)
+		}
+		if errors.Is(reqErr, context.Canceled) {
+			return nil, fmt.Errorf("amvera: canceled: %w", reqErr)
+		}
+		return nil, fmt.Errorf("amvera: request failed: %w", reqErr)
+	}
+	if reqErr != nil {
+		return nil, fmt.Errorf("amvera: request failed: %w", reqErr)
+	}
+
+	if status != http.StatusOK {
+		return nil, c.mapNonOK(status, raw)
 	}
 
 	var parsed amveraResponse
@@ -160,6 +188,36 @@ func (c *AmveraClient) Complete(ctx context.Context, messages []Message) (*Compl
 		InputTokens:  firstNonZeroInt(extractInt(parsed.Usage.PromptTokens), extractInt(parsed.Usage.InputTextTokens)),
 		OutputTokens: firstNonZeroInt(extractInt(parsed.Usage.CompletionTokens), extractInt(parsed.Usage.CompletionTokensAlt)),
 	}, nil
+}
+
+func isRetryableTransportError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+
+	lower := strings.ToLower(err.Error())
+	return strings.Contains(lower, "tls handshake timeout") ||
+		strings.Contains(lower, "connection reset by peer") ||
+		strings.Contains(lower, "i/o timeout")
+}
+
+func waitRetry(ctx context.Context, d time.Duration) error {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func (c *AmveraClient) mapNonOK(status int, raw []byte) error {

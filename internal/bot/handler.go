@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/chillmeal/bookably-agent/internal/actorctx"
 	"github.com/chillmeal/bookably-agent/internal/domain"
 	"github.com/chillmeal/bookably-agent/internal/interpreter"
 	"github.com/chillmeal/bookably-agent/internal/session"
@@ -30,11 +31,11 @@ var (
 )
 
 type HandlerConfig struct {
-	WebhookSecret     string
-	WebhookURL        string
-	MiniAppURL        string
-	DefaultProviderID string
-	PlanTTL           time.Duration
+	WebhookSecret string
+	WebhookURL    string
+	MiniAppURL    string
+	PlanTTL       time.Duration
+	WorkerTimeout time.Duration
 }
 
 type TelegramGateway interface {
@@ -51,6 +52,10 @@ type InterpreterService interface {
 	Interpret(ctx context.Context, userMessage string, convo interpreter.ConversationContext) (*interpreter.ActionPlan, error)
 }
 
+type interpreterWithProgress interface {
+	InterpretWithProgress(ctx context.Context, userMessage string, convo interpreter.ConversationContext, onProgress func(interpreter.Progress)) (*interpreter.ActionPlan, error)
+}
+
 type ExecutionResult struct {
 	Message string
 }
@@ -59,53 +64,39 @@ type ACPExecutor interface {
 	ExecuteConfirmed(ctx context.Context, s *session.Session, pending *session.PendingPlan) (*ExecutionResult, error)
 }
 
-type AuthToken struct {
-	AccessToken  string
-	RefreshToken string
-}
-
-type SpecialistTokenStore interface {
-	SaveToken(ctx context.Context, specialistID string, token AuthToken) error
-}
-
 type Handler struct {
 	store       session.SessionStore
 	interpreter InterpreterService
 	provider    domain.Provider
 	executor    ACPExecutor
-	tokenStore  SpecialistTokenStore
 	telegram    TelegramGateway
 	logger      *observability.Logger
 
-	webhookSecret     string
-	webhookURL        string
-	miniAppURL        string
-	defaultProviderID string
-	planTTL           time.Duration
+	webhookSecret string
+	webhookURL    string
+	miniAppURL    string
+	planTTL       time.Duration
+	workerTimeout time.Duration
 
 	clock func() time.Time
 
 	locksMu   sync.Mutex
 	chatLocks map[int64]*sync.Mutex
+	processWG sync.WaitGroup
 }
 
 type webhookUpdate struct {
+	UpdateID      int64                        `json:"update_id,omitempty"`
 	Message       *telegramMessageUpdate       `json:"message,omitempty"`
 	CallbackQuery *telegramCallbackQueryUpdate `json:"callback_query,omitempty"`
 }
 
 type telegramMessageUpdate struct {
-	MessageID  int64               `json:"message_id"`
-	Chat       telegramChat        `json:"chat"`
-	From       telegramFrom        `json:"from"`
-	Text       string              `json:"text"`
-	Date       int64               `json:"date"`
-	WebAppData *telegramWebAppData `json:"web_app_data,omitempty"`
-}
-
-type telegramWebAppData struct {
-	Data       string `json:"data"`
-	ButtonText string `json:"button_text"`
+	MessageID int64        `json:"message_id"`
+	Chat      telegramChat `json:"chat"`
+	From      telegramFrom `json:"from"`
+	Text      string       `json:"text"`
+	Date      int64        `json:"date"`
 }
 
 type telegramCallbackQueryUpdate struct {
@@ -128,7 +119,7 @@ type telegramFrom struct {
 	ID int64 `json:"id"`
 }
 
-func NewHandler(cfg HandlerConfig, store session.SessionStore, interp InterpreterService, provider domain.Provider, executor ACPExecutor, tokenStore SpecialistTokenStore, tg TelegramGateway) (*Handler, error) {
+func NewHandler(cfg HandlerConfig, store session.SessionStore, interp InterpreterService, provider domain.Provider, executor ACPExecutor, tg TelegramGateway) (*Handler, error) {
 	if store == nil {
 		return nil, errors.New("bot handler: session store is nil")
 	}
@@ -144,37 +135,33 @@ func NewHandler(cfg HandlerConfig, store session.SessionStore, interp Interprete
 	if tg == nil {
 		return nil, errors.New("bot handler: telegram gateway is nil")
 	}
-	if tokenStore == nil {
-		return nil, errors.New("bot handler: token store is nil")
-	}
 	if strings.TrimSpace(cfg.WebhookSecret) == "" {
 		return nil, errors.New("bot handler: webhook secret is required")
 	}
 	if strings.TrimSpace(cfg.MiniAppURL) == "" {
 		return nil, errors.New("bot handler: mini app URL is required")
 	}
-	if strings.TrimSpace(cfg.DefaultProviderID) == "" {
-		return nil, errors.New("bot handler: default provider id is required")
-	}
 	if cfg.PlanTTL <= 0 {
 		cfg.PlanTTL = 15 * time.Minute
 	}
+	if cfg.WorkerTimeout <= 0 {
+		cfg.WorkerTimeout = 90 * time.Second
+	}
 
 	return &Handler{
-		store:             store,
-		interpreter:       interp,
-		provider:          provider,
-		executor:          executor,
-		tokenStore:        tokenStore,
-		telegram:          tg,
-		logger:            observability.NewLogger(nil),
-		webhookSecret:     strings.TrimSpace(cfg.WebhookSecret),
-		webhookURL:        strings.TrimSpace(cfg.WebhookURL),
-		miniAppURL:        strings.TrimSpace(cfg.MiniAppURL),
-		defaultProviderID: strings.TrimSpace(cfg.DefaultProviderID),
-		planTTL:           cfg.PlanTTL,
-		clock:             func() time.Time { return time.Now().UTC() },
-		chatLocks:         make(map[int64]*sync.Mutex),
+		store:         store,
+		interpreter:   interp,
+		provider:      provider,
+		executor:      executor,
+		telegram:      tg,
+		logger:        observability.NewLogger(nil),
+		webhookSecret: strings.TrimSpace(cfg.WebhookSecret),
+		webhookURL:    strings.TrimSpace(cfg.WebhookURL),
+		miniAppURL:    strings.TrimSpace(cfg.MiniAppURL),
+		planTTL:       cfg.PlanTTL,
+		workerTimeout: cfg.WorkerTimeout,
+		clock:         func() time.Time { return time.Now().UTC() },
+		chatLocks:     make(map[int64]*sync.Mutex),
 	}, nil
 }
 
@@ -239,24 +226,74 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
+	w.WriteHeader(http.StatusOK)
 
-	processErr := h.withChatLock(chatID, func() error {
-		switch {
-		case update.Message != nil:
-			return h.handleMessage(r.Context(), update.Message)
-		case update.CallbackQuery != nil:
-			return h.handleCallback(r.Context(), update.CallbackQuery)
-		default:
-			return nil
-		}
+	ackMS := time.Since(started).Milliseconds()
+	h.logInfo(chatID, "", "bot/handler", started, map[string]any{
+		"event":          "update.accepted",
+		"update_id":      update.UpdateID,
+		"webhook_ack_ms": ackMS,
 	})
 
-	if processErr != nil {
-		h.logError(chatID, "", "bot/handler", started, errorKind(processErr), processErr, map[string]any{"stage": "process_update"})
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
-	}
-	w.WriteHeader(http.StatusOK)
+	h.processWG.Add(1)
+	go func(chatID int64, update webhookUpdate) {
+		defer h.processWG.Done()
+
+		processStarted := time.Now()
+		ctx, cancel := context.WithTimeout(context.Background(), h.workerTimeout)
+		defer cancel()
+
+		processErr := h.withChatLock(chatID, func() (retErr error) {
+			duplicate, err := h.isDuplicateUpdate(ctx, chatID, update.UpdateID)
+			if err != nil {
+				return err
+			}
+			if duplicate {
+				h.logInfo(chatID, "", "bot/handler", processStarted, map[string]any{
+					"event":         "update.duplicate_skipped",
+					"update_id":     update.UpdateID,
+					"duplicate":     true,
+					"stage":         "dedupe",
+					"processing_ms": time.Since(processStarted).Milliseconds(),
+				})
+				return nil
+			}
+
+			// Mark update as processed even when downstream handling fails.
+			// This prevents Telegram retry storms from duplicating user-visible errors.
+			defer func() {
+				if markErr := h.markUpdateProcessed(ctx, chatID, update.UpdateID); markErr != nil {
+					if retErr == nil {
+						retErr = markErr
+						return
+					}
+					retErr = errors.Join(retErr, markErr)
+				}
+			}()
+
+			switch {
+			case update.Message != nil:
+				if err := h.handleMessage(ctx, update.Message); err != nil {
+					return err
+				}
+			case update.CallbackQuery != nil:
+				if err := h.handleCallback(ctx, update.CallbackQuery); err != nil {
+					return err
+				}
+			default:
+				return nil
+			}
+			return nil
+		})
+
+		if processErr != nil {
+			h.logError(chatID, "", "bot/handler", processStarted, errorKind(processErr), processErr, map[string]any{
+				"stage":         "process_update",
+				"update_id":     update.UpdateID,
+				"processing_ms": time.Since(processStarted).Milliseconds(),
+			})
+		}
+	}(chatID, update)
 }
 
 func (h *Handler) withChatLock(chatID int64, fn func() error) error {
@@ -288,23 +325,32 @@ func (h *Handler) handleMessage(ctx context.Context, msg *telegramMessageUpdate)
 	if err != nil {
 		return err
 	}
-
-	if msg.WebAppData != nil {
-		return h.handleWebAppData(ctx, s, msg)
+	if s.TelegramUserID > 0 && s.TelegramUserID != msg.From.ID {
+		s.ProviderID = ""
+		s.Timezone = ""
+		s.PendingPlan = nil
+		s.ClarificationCount = 0
+	}
+	s.TelegramUserID = msg.From.ID
+	if s.TelegramUserID <= 0 {
+		if _, sendErr := h.telegram.SendText(ctx, chatID, "Не удалось определить Telegram пользователя\\. Попробуй позже\\.", nil); sendErr != nil {
+			return sendErr
+		}
+		return h.store.Save(ctx, s)
 	}
 
-	if strings.TrimSpace(s.ProviderID) == "" {
-		return h.sendLoginButton(ctx, chatID)
-	}
-	if strings.TrimSpace(s.ProviderID) != h.defaultProviderID {
-		return h.sendLoginButton(ctx, chatID)
-	}
-
-	if strings.TrimSpace(s.Timezone) == "" {
-		if err := h.hydrateSessionProviderInfo(ctx, s); err != nil {
+	actorCtx := h.withActorContext(ctx, s)
+	if strings.TrimSpace(s.ProviderID) == "" || strings.TrimSpace(s.Timezone) == "" {
+		if err := h.hydrateSessionProviderInfo(actorCtx, s); err != nil {
 			h.logError(chatID, "", "bot/handler", time.Now(), errorKind(err), err, map[string]any{"stage": "hydrate_provider_info"})
-			if _, sendErr := h.telegram.SendText(ctx, chatID, FormatError(errorKind(err)), nil); sendErr != nil {
-				return sendErr
+			if errors.Is(err, domain.ErrForbidden) {
+				if _, sendErr := h.telegram.SendText(ctx, chatID, "Нет доступа к операциям специалиста\\. Проверь, что аккаунт активирован как специалист\\.", nil); sendErr != nil {
+					return sendErr
+				}
+			} else {
+				if _, sendErr := h.telegram.SendText(ctx, chatID, FormatError(errorKind(err)), nil); sendErr != nil {
+					return sendErr
+				}
 			}
 			return h.store.Save(ctx, s)
 		}
@@ -321,15 +367,28 @@ func (h *Handler) handleMessage(ctx context.Context, msg *telegramMessageUpdate)
 		ClearPendingPlan(s)
 	}
 
-	_ = h.telegram.Draft(ctx, chatID, "🤔 Анализирую\\.\\.\\.")
-
 	convo := interpreter.ConversationContext{
 		Timezone: s.Timezone,
 		History:  convertHistory(s.DialogHistory),
 	}
-	plan, err := h.interpreter.Interpret(ctx, strings.TrimSpace(msg.Text), convo)
+	progress, stopProgress := h.newStreamProgressReporter(ctx, chatID)
+	defer stopProgress()
+
+	userMessage := strings.TrimSpace(msg.Text)
+	var plan *interpreter.ActionPlan
+	if streamingInterpreter, ok := h.interpreter.(interpreterWithProgress); ok {
+		plan, err = streamingInterpreter.InterpretWithProgress(ctx, userMessage, convo, progress)
+	} else {
+		plan, err = h.interpreter.Interpret(ctx, userMessage, convo)
+	}
 	if err != nil {
 		h.logError(chatID, "", "bot/handler", time.Now(), errorKind(err), err, map[string]any{"stage": "interpret"})
+		if errorKind(err) == "timeout" {
+			h.logInfo(chatID, "", "bot/handler", time.Now(), map[string]any{
+				"event": "interpret.timeout",
+				"stage": "interpret",
+			})
+		}
 		_, sendErr := h.telegram.SendText(ctx, chatID, FormatError(errorKind(err)), nil)
 		if sendErr != nil {
 			return sendErr
@@ -337,7 +396,7 @@ func (h *Handler) handleMessage(ctx context.Context, msg *telegramMessageUpdate)
 		return h.store.Save(ctx, s)
 	}
 
-	AppendHistory(s, "user", msg.Text)
+	AppendHistory(s, "user", userMessage)
 
 	if plan.Intent == interpreter.IntentUnknown || plan.Confidence < 0.5 {
 		if _, err := h.telegram.Finalize(ctx, chatID, FormatUnknownIntent(), nil); err != nil {
@@ -362,12 +421,137 @@ func (h *Handler) handleMessage(ctx context.Context, msg *telegramMessageUpdate)
 	s.ClarificationCount = 0
 	switch plan.Intent {
 	case interpreter.IntentListBookings:
-		return h.handleListBookings(ctx, s, plan)
+		return h.handleListBookings(actorCtx, s, plan)
 	case interpreter.IntentFindNextSlot:
-		return h.handleFindNextSlot(ctx, s, plan)
+		return h.handleFindNextSlot(actorCtx, s, plan)
 	default:
-		return h.handleWritePreview(ctx, s, plan)
+		return h.handleWritePreview(actorCtx, s, plan)
 	}
+}
+
+func (h *Handler) isDuplicateUpdate(ctx context.Context, chatID int64, updateID int64) (bool, error) {
+	if updateID <= 0 {
+		return false, nil
+	}
+	s, err := LoadOrCreate(ctx, h.store, chatID)
+	if err != nil {
+		return false, err
+	}
+	return s.LastProcessedUpdateID >= updateID, nil
+}
+
+func (h *Handler) markUpdateProcessed(ctx context.Context, chatID int64, updateID int64) error {
+	if updateID <= 0 {
+		return nil
+	}
+	s, err := LoadOrCreate(ctx, h.store, chatID)
+	if err != nil {
+		return err
+	}
+	if updateID <= s.LastProcessedUpdateID {
+		return nil
+	}
+	s.LastProcessedUpdateID = updateID
+	return h.store.Save(ctx, s)
+}
+
+func (h *Handler) newStreamProgressReporter(ctx context.Context, chatID int64) (func(interpreter.Progress), func()) {
+	var (
+		mu         sync.Mutex
+		lastAt     time.Time
+		lastKey    string
+		onceStop   sync.Once
+		startedAt  = time.Now()
+		stageIndex int
+	)
+
+	stages := []string{
+		"🤔 Анализирую\\.\\.\\.",
+		"🤔 Уточняю детали\\.\\.\\.",
+		"🤔 Готовлю ответ\\.\\.\\.",
+	}
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+
+	sendDraft := func(text, stage string) {
+		mu.Lock()
+		now := time.Now()
+		if !lastAt.IsZero() && now.Sub(lastAt) < 1800*time.Millisecond {
+			mu.Unlock()
+			return
+		}
+		if text == lastKey {
+			mu.Unlock()
+			return
+		}
+		mu.Unlock()
+
+		if err := h.telegram.Draft(ctx, chatID, text); err != nil {
+			h.logError(chatID, "", "bot/handler", now, "ErrUpstream", err, map[string]any{
+				"event": "draft.failed",
+				"stage": stage,
+			})
+			_ = h.telegram.SendChatAction(ctx, chatID, "typing")
+			return
+		}
+
+		mu.Lock()
+		lastAt = now
+		lastKey = text
+		mu.Unlock()
+	}
+
+	sendDraft(stages[0], "draft_start")
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-done:
+				return
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				mu.Lock()
+				if stageIndex < len(stages)-1 {
+					stageIndex++
+				}
+				next := stages[stageIndex]
+				mu.Unlock()
+				sendDraft(next, "heartbeat")
+			}
+		}
+	}()
+
+	progressFn := func(progress interpreter.Progress) {
+		now := time.Now()
+		elapsed := now.Sub(progress.StartedAt)
+		if progress.StartedAt.IsZero() {
+			elapsed = now.Sub(startedAt)
+		}
+
+		text := stages[0]
+		switch {
+		case progress.ChunkCount >= 24 || elapsed >= 20*time.Second:
+			text = stages[2]
+		case progress.ChunkCount >= 8 || elapsed >= 8*time.Second:
+			text = stages[1]
+		}
+		sendDraft(text, "progress")
+	}
+
+	stopFn := func() {
+		onceStop.Do(func() {
+			close(done)
+			wg.Wait()
+		})
+	}
+
+	return progressFn, stopFn
 }
 
 func (h *Handler) handleListBookings(ctx context.Context, s *session.Session, plan *interpreter.ActionPlan) error {
@@ -472,10 +656,10 @@ func (h *Handler) handleWritePreview(ctx context.Context, s *session.Session, pl
 		return h.store.Save(ctx, s)
 	}
 
-	if plan.Intent != interpreter.IntentCreateBooking &&
-		preview.AvailabilityChange.AddedSlots+preview.AvailabilityChange.RemovedSlots > 20 {
-		return h.sendDeepLinkEscalation(ctx, s, chatID, "availability", "impact_gt_20")
-	}
+	highAvailabilityImpact := (plan.Intent == interpreter.IntentSetWorkingHours ||
+		plan.Intent == interpreter.IntentAddBreak ||
+		plan.Intent == interpreter.IntentCloseRange) &&
+		(preview.AvailabilityChange.AddedSlots+preview.AvailabilityChange.RemovedSlots > 20)
 
 	pending := SetPendingPlan(s, *plan, 0, "", &PendingPlanOptions{
 		SlotCandidates: preview.ProposedSlots,
@@ -517,6 +701,12 @@ func (h *Handler) handleWritePreview(ctx context.Context, s *session.Session, pl
 
 	keyboard := BuildPreviewKeyboard(pending.ID)
 	text := formatPreviewByIntent(*preview, plan.Intent, location)
+	if highAvailabilityImpact {
+		text += "\n\n⚠️ Рекомендация: для большого объёма изменений проверь детали в приложении, затем подтверди здесь или в Mini App\\."
+		keyboard.InlineKeyboard = append(keyboard.InlineKeyboard, []InlineKeyboardButton{
+			NewWebAppButton("Открыть в приложении →", h.BuildDeepLink("availability", "impact_gt_20")),
+		})
+	}
 	msgID, err := h.telegram.Finalize(ctx, chatID, text, &keyboard)
 	if err != nil {
 		return err
@@ -554,6 +744,22 @@ func (h *Handler) handleCallback(ctx context.Context, cb *telegramCallbackQueryU
 	if err != nil {
 		return err
 	}
+	if s.TelegramUserID > 0 && s.TelegramUserID != cb.From.ID {
+		s.ProviderID = ""
+		s.Timezone = ""
+		s.PendingPlan = nil
+		s.ClarificationCount = 0
+	}
+	s.TelegramUserID = cb.From.ID
+	actorCtx := h.withActorContext(ctx, s)
+	if strings.TrimSpace(s.ProviderID) == "" || strings.TrimSpace(s.Timezone) == "" {
+		if err := h.hydrateSessionProviderInfo(actorCtx, s); err != nil {
+			if _, sendErr := h.telegram.SendText(ctx, chatID, FormatError(errorKind(err)), nil); sendErr != nil {
+				return sendErr
+			}
+			return h.store.Save(ctx, s)
+		}
+	}
 	if s.PendingPlan == nil || s.PendingPlan.ID != parsed.PlanID {
 		_, sendErr := h.telegram.SendText(ctx, chatID, "Запрос устарел, повтори заново\\.", nil)
 		if sendErr != nil {
@@ -572,7 +778,7 @@ func (h *Handler) handleCallback(ctx context.Context, cb *telegramCallbackQueryU
 
 	switch parsed.Type {
 	case CallbackTypeCancel:
-		if err := h.telegram.EditMessageReplyMarkup(ctx, chatID, s.PendingPlan.PreviewMsgID, &InlineKeyboardMarkup{InlineKeyboard: [][]InlineKeyboardButton{}}); err != nil {
+		if err := h.clearPreviewKeyboard(ctx, chatID, s.PendingPlan.PreviewMsgID); err != nil {
 			return err
 		}
 		if _, err := h.telegram.SendText(ctx, chatID, "Понял, ничего не изменено\\.", nil); err != nil {
@@ -583,7 +789,7 @@ func (h *Handler) handleCallback(ctx context.Context, cb *telegramCallbackQueryU
 	case CallbackTypeSlot:
 		return h.handleSlotSelection(ctx, s, parsed.SlotIndex)
 	case CallbackTypeConfirm:
-		return h.handleConfirm(ctx, s)
+		return h.handleConfirm(actorCtx, s)
 	default:
 		return nil
 	}
@@ -623,7 +829,7 @@ func (h *Handler) handleSlotSelection(ctx context.Context, s *session.Session, i
 		Start:     start.UTC(),
 		End:       end.UTC(),
 	}
-	if err := h.telegram.EditMessageReplyMarkup(ctx, s.ChatID, s.PendingPlan.PreviewMsgID, &InlineKeyboardMarkup{InlineKeyboard: [][]InlineKeyboardButton{}}); err != nil {
+	if err := h.clearPreviewKeyboard(ctx, s.ChatID, s.PendingPlan.PreviewMsgID); err != nil {
 		return err
 	}
 
@@ -654,7 +860,7 @@ func (h *Handler) handleSlotSelection(ctx context.Context, s *session.Session, i
 }
 
 func (h *Handler) handleConfirm(ctx context.Context, s *session.Session) error {
-	if err := h.telegram.EditMessageReplyMarkup(ctx, s.ChatID, s.PendingPlan.PreviewMsgID, &InlineKeyboardMarkup{InlineKeyboard: [][]InlineKeyboardButton{}}); err != nil {
+	if err := h.clearPreviewKeyboard(ctx, s.ChatID, s.PendingPlan.PreviewMsgID); err != nil {
 		return err
 	}
 	if _, err := h.telegram.SendText(ctx, s.ChatID, "Выполняю\\.\\.\\.", nil); err != nil {
@@ -665,7 +871,12 @@ func (h *Handler) handleConfirm(ctx context.Context, s *session.Session) error {
 	if err != nil {
 		h.logError(s.ChatID, string(s.PendingPlan.Plan.Intent), "bot/handler", time.Now(), errorKind(err), err, map[string]any{"stage": "execute_confirmed"})
 		if errors.Is(err, ErrExecutionPolicyViolation) {
-			_, sendErr := h.telegram.SendText(ctx, s.ChatID, "Не удалось применить изменения\\. Причина: policy violation\\.", nil)
+			_, sendErr := h.telegram.SendText(ctx, s.ChatID, buildStructuredResponse(
+				"Команда подтверждена.",
+				"Проверил ограничения выполнения.",
+				"ACP отклонил выполнение по policy.",
+				"Проверь формулировку команды и повтори запрос.",
+			), nil)
 			return sendErr
 		}
 		if errors.Is(err, ErrExecutionContractBlocked) {
@@ -675,7 +886,12 @@ func (h *Handler) handleConfirm(ctx context.Context, s *session.Session) error {
 					{NewWebAppButton("Открыть в приложении →", link)},
 				},
 			}
-			if _, sendErr := h.telegram.SendText(ctx, s.ChatID, "Эта операция временно недоступна в текущем контракте API\\. Открой приложение для выполнения\\.", &keyboard); sendErr != nil {
+			if _, sendErr := h.telegram.SendText(ctx, s.ChatID, buildStructuredResponse(
+				"Команда подтверждена.",
+				"Проверил доступность исполнения по текущему API-контракту.",
+				"Эта операция временно недоступна в чате.",
+				"Открой приложение кнопкой ниже и выполни действие там.",
+			), &keyboard); sendErr != nil {
 				return sendErr
 			}
 			ClearPendingPlan(s)
@@ -697,16 +913,44 @@ func (h *Handler) handleConfirm(ctx context.Context, s *session.Session) error {
 		return h.store.Save(ctx, s)
 	}
 
-	message := "Готово\\. Изменения применены\\."
+	actionMessage := "Изменения успешно применены."
 	if result != nil && strings.TrimSpace(result.Message) != "" {
-		message = escapeV2(strings.TrimSpace(result.Message))
+		actionMessage = strings.TrimSpace(result.Message)
 	}
+	message := buildStructuredResponse(
+		"Подтверждение получено.",
+		"Выполнил команду через ACP.",
+		actionMessage,
+		"Можно отправить следующую команду в чат.",
+	)
 	if _, err := h.telegram.SendText(ctx, s.ChatID, message, nil); err != nil {
 		return err
 	}
 
 	ClearPendingPlan(s)
 	return h.store.Save(ctx, s)
+}
+
+func (h *Handler) clearPreviewKeyboard(ctx context.Context, chatID int64, messageID int64) error {
+	err := h.telegram.EditMessageReplyMarkup(ctx, chatID, messageID, &InlineKeyboardMarkup{InlineKeyboard: [][]InlineKeyboardButton{}})
+	if err == nil {
+		return nil
+	}
+	if isMessageNotModified(err) {
+		h.logInfo(chatID, "", "bot/handler", time.Now(), map[string]any{
+			"event":      "reply_markup.noop",
+			"message_id": messageID,
+		})
+		return nil
+	}
+	return err
+}
+
+func isMessageNotModified(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "message is not modified")
 }
 
 func (h *Handler) BuildDeepLink(action, contextValue string) string {
@@ -728,7 +972,12 @@ func (h *Handler) sendDeepLinkEscalation(ctx context.Context, s *session.Session
 			{NewWebAppButton("Открыть в приложении →", link)},
 		},
 	}
-	text := "Для этого шага удобнее перейти в приложение\\."
+	text := buildStructuredResponse(
+		"Для этого сценария чат ограничен.",
+		"Подготовил быстрый переход в приложение.",
+		"Команда в чате не выполнена.",
+		"Открой Mini App кнопкой ниже и продолжи там.",
+	)
 	if _, err := h.telegram.SendText(ctx, chatID, text, &keyboard); err != nil {
 		return err
 	}
@@ -752,14 +1001,14 @@ func buildRetryKeyboard(planID string) InlineKeyboardMarkup {
 		InlineKeyboard: [][]InlineKeyboardButton{
 			{
 				{
-					Text:         "🔁 Повторить",
-					CallbackData: ConfirmData(planID),
-					Style:        buttonStyleSuccess,
-				},
-				{
 					Text:         "❌ Отменить",
 					CallbackData: CancelData(planID),
 					Style:        buttonStyleDanger,
+				},
+				{
+					Text:         "🔁 Повторить",
+					CallbackData: ConfirmData(planID),
+					Style:        buttonStyleSuccess,
 				},
 			},
 		},
@@ -822,84 +1071,18 @@ func mapActionParams(p interpreter.ActionParams) domain.ActionParams {
 	return out
 }
 
-type webAppAuthPayload struct {
-	Token        string `json:"token"`
-	RefreshToken string `json:"refreshToken"`
-	SpecialistID string `json:"specialistId"`
-}
-
-func (h *Handler) handleWebAppData(ctx context.Context, s *session.Session, msg *telegramMessageUpdate) error {
-	if msg == nil || msg.WebAppData == nil {
-		return nil
+func (h *Handler) withActorContext(ctx context.Context, s *session.Session) context.Context {
+	if s == nil || s.TelegramUserID <= 0 {
+		return ctx
 	}
-	chatID := msg.Chat.ID
-
-	var payload webAppAuthPayload
-	if err := json.Unmarshal([]byte(msg.WebAppData.Data), &payload); err != nil {
-		_, _ = h.telegram.SendText(ctx, chatID, "Не удалось войти\\. Попробуй ещё раз\\.", nil)
-		return h.sendLoginButton(ctx, chatID)
-	}
-
-	payload.Token = strings.TrimSpace(payload.Token)
-	payload.RefreshToken = strings.TrimSpace(payload.RefreshToken)
-	payload.SpecialistID = strings.TrimSpace(payload.SpecialistID)
-	if payload.Token == "" || payload.SpecialistID == "" {
-		_, _ = h.telegram.SendText(ctx, chatID, "Не удалось войти\\. Попробуй ещё раз\\.", nil)
-		return h.sendLoginButton(ctx, chatID)
-	}
-	if payload.SpecialistID != h.defaultProviderID {
-		_, _ = h.telegram.SendText(ctx, chatID, "Этот аккаунт не поддерживается в текущей конфигурации бота\\.", nil)
-		return h.sendLoginButton(ctx, chatID)
-	}
-
-	if err := h.tokenStore.SaveToken(ctx, payload.SpecialistID, AuthToken{
-		AccessToken:  payload.Token,
-		RefreshToken: payload.RefreshToken,
-	}); err != nil {
-		return err
-	}
-
-	s.ProviderID = payload.SpecialistID
-	if err := h.hydrateSessionProviderInfo(ctx, s); err != nil {
-		h.logError(chatID, "", "bot/handler", time.Now(), errorKind(err), err, map[string]any{"stage": "auth_hydrate_provider_info"})
-		if _, sendErr := h.telegram.SendText(ctx, chatID, "Вход выполнен, но профиль специалиста пока недоступен\\. Попробуй ещё раз\\.", nil); sendErr != nil {
-			return sendErr
-		}
-		return h.store.Save(ctx, s)
-	}
-
-	if err := h.store.Save(ctx, s); err != nil {
-		return err
-	}
-	_, err := h.telegram.SendText(ctx, chatID, "Вошёл\\. Теперь можешь управлять записями\\.", nil)
-	return err
-}
-
-func (h *Handler) sendLoginButton(ctx context.Context, chatID int64) error {
-	link := strings.TrimSpace(h.miniAppURL)
-	if strings.Contains(link, "?") {
-		link += "&mode=bot_auth"
-	} else {
-		link += "?mode=bot_auth"
-	}
-	keyboard := InlineKeyboardMarkup{
-		InlineKeyboard: [][]InlineKeyboardButton{
-			{NewWebAppButton("Войти в Bookably", link)},
-		},
-	}
-	_, err := h.telegram.SendText(ctx, chatID, "Чтобы начать, войди в свой аккаунт Bookably\\.", &keyboard)
-	return err
+	return actorctx.WithTelegramUserID(ctx, s.TelegramUserID)
 }
 
 func (h *Handler) hydrateSessionProviderInfo(ctx context.Context, s *session.Session) error {
 	if s == nil {
 		return errors.New("bot handler: session is nil")
 	}
-	providerID := strings.TrimSpace(s.ProviderID)
-	if providerID == "" {
-		return errors.Join(domain.ErrValidation, errors.New("provider_id is required"))
-	}
-	info, err := h.provider.GetProviderInfo(ctx, providerID)
+	info, err := h.provider.GetProviderInfo(ctx, strings.TrimSpace(s.ProviderID))
 	if err != nil {
 		return err
 	}
@@ -1036,6 +1219,8 @@ func errorKind(err error) string {
 		return "upstream"
 	case errors.Is(err, context.DeadlineExceeded):
 		return "timeout"
+	case errors.Is(err, domain.ErrForbidden), errors.Is(err, domain.ErrUnauthorized):
+		return "forbidden"
 	case errors.Is(err, domain.ErrNotFound):
 		return "not_found"
 	case errors.Is(err, domain.ErrConflict):
@@ -1066,6 +1251,63 @@ func (h *Handler) logError(chatID int64, intent, component string, started time.
 		ErrorType:  errType,
 		Error:      err,
 		Fields:     fields,
+	})
+}
+
+func (h *Handler) logInfo(chatID int64, intent, component string, started time.Time, fields map[string]any) {
+	if h == nil || h.logger == nil {
+		return
+	}
+	duration := int64(0)
+	if !started.IsZero() {
+		duration = time.Since(started).Milliseconds()
+	}
+	h.logger.LogInfo(observability.Entry{
+		TraceID:    newTraceID(),
+		ChatID:     chatID,
+		Intent:     strings.TrimSpace(intent),
+		Component:  component,
+		DurationMS: duration,
+		Fields:     fields,
+	})
+}
+
+func (h *Handler) WaitForIdle(timeout time.Duration) bool {
+	if h == nil {
+		return true
+	}
+	if timeout <= 0 {
+		timeout = 3 * time.Second
+	}
+	done := make(chan struct{})
+	go func() {
+		h.processWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
+}
+
+func (h *Handler) logAuthEvent(chatID int64, event string, fields map[string]any) {
+	if h == nil || h.logger == nil {
+		return
+	}
+	payload := map[string]any{
+		"event": strings.TrimSpace(event),
+	}
+	for k, v := range fields {
+		payload[k] = v
+	}
+	h.logger.LogInfo(observability.Entry{
+		TraceID:    newTraceID(),
+		ChatID:     chatID,
+		Component:  "bot/auth",
+		DurationMS: 0,
+		Fields:     payload,
 	})
 }
 

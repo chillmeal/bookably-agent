@@ -25,28 +25,15 @@ func (f *fakeRunSubmitter) SubmitAndWait(ctx context.Context, run acp.ACPRun) (*
 	return &acp.ACPRunResult{RunID: "run-1", Status: acp.ACPStatusCompleted}, nil
 }
 
-type fakeTokenProvider struct {
-	token string
-	err   error
-}
-
-func (f *fakeTokenProvider) GetAccessToken(ctx context.Context, specialistID string) (string, error) {
-	if f.err != nil {
-		return "", f.err
-	}
-	return f.token, nil
-}
-
 func TestRuntimeACPExecutorCancelRunShape(t *testing.T) {
 	runner := &fakeRunSubmitter{}
-	tokens := &fakeTokenProvider{token: "tok"}
 
-	executor, err := NewRuntimeACPExecutor("https://bookably.test", runner, tokens)
+	executor, err := NewRuntimeACPExecutor("https://bookably.test", "svc-key", runner)
 	if err != nil {
 		t.Fatalf("NewRuntimeACPExecutor: %v", err)
 	}
 
-	s := &session.Session{ChatID: 10, ProviderID: "spec-1"}
+	s := &session.Session{ChatID: 10, ProviderID: "spec-1", TelegramUserID: 123456789}
 	pending := &session.PendingPlan{
 		ID:             "plan-1",
 		IdempotencyKey: "idem-1",
@@ -81,18 +68,23 @@ func TestRuntimeACPExecutorCancelRunShape(t *testing.T) {
 	if runner.lastRun.Metadata["risk_level"] != string(domain.RiskHigh) {
 		t.Fatalf("unexpected risk level metadata: %#v", runner.lastRun.Metadata)
 	}
+	if runner.lastRun.Steps[0].Config.Headers["X-Bot-Service-Key"] != "svc-key" {
+		t.Fatalf("expected X-Bot-Service-Key header, got %q", runner.lastRun.Steps[0].Config.Headers["X-Bot-Service-Key"])
+	}
+	if runner.lastRun.Steps[0].Config.Headers["X-Telegram-User-Id"] != "123456789" {
+		t.Fatalf("expected X-Telegram-User-Id header, got %q", runner.lastRun.Steps[0].Config.Headers["X-Telegram-User-Id"])
+	}
 }
 
 func TestRuntimeACPExecutorCreateBookingIsContractBlocked(t *testing.T) {
 	runner := &fakeRunSubmitter{}
-	tokens := &fakeTokenProvider{token: "tok"}
 
-	executor, err := NewRuntimeACPExecutor("https://bookably.test", runner, tokens)
+	executor, err := NewRuntimeACPExecutor("https://bookably.test", "svc-key", runner)
 	if err != nil {
 		t.Fatalf("NewRuntimeACPExecutor: %v", err)
 	}
 
-	s := &session.Session{ChatID: 11, ProviderID: "spec-1"}
+	s := &session.Session{ChatID: 11, ProviderID: "spec-1", TelegramUserID: 123456789}
 	pending := &session.PendingPlan{
 		ID:             "plan-1",
 		IdempotencyKey: "idem-1",
@@ -116,14 +108,13 @@ func TestRuntimeACPExecutorCreateBookingIsContractBlocked(t *testing.T) {
 
 func TestRuntimeACPExecutorAvailabilityRunShape(t *testing.T) {
 	runner := &fakeRunSubmitter{}
-	tokens := &fakeTokenProvider{token: "tok"}
 
-	executor, err := NewRuntimeACPExecutor("https://bookably.test", runner, tokens)
+	executor, err := NewRuntimeACPExecutor("https://bookably.test", "svc-key", runner)
 	if err != nil {
 		t.Fatalf("NewRuntimeACPExecutor: %v", err)
 	}
 
-	s := &session.Session{ChatID: 12, ProviderID: "spec-1", Timezone: "Europe/Moscow"}
+	s := &session.Session{ChatID: 12, ProviderID: "spec-1", TelegramUserID: 987654321, Timezone: "Europe/Moscow"}
 	start := time.Date(2026, 3, 24, 9, 0, 0, 0, time.UTC)
 	end := start.Add(time.Hour)
 	pending := &session.PendingPlan{
@@ -188,14 +179,13 @@ func TestRuntimeACPExecutorMapsTransientAndPolicy(t *testing.T) {
 					return nil, tc.runnerErr
 				},
 			}
-			tokens := &fakeTokenProvider{token: "tok"}
 
-			executor, err := NewRuntimeACPExecutor("https://bookably.test", runner, tokens)
+			executor, err := NewRuntimeACPExecutor("https://bookably.test", "svc-key", runner)
 			if err != nil {
 				t.Fatalf("NewRuntimeACPExecutor: %v", err)
 			}
 
-			s := &session.Session{ChatID: 13, ProviderID: "spec-1"}
+			s := &session.Session{ChatID: 13, ProviderID: "spec-1", TelegramUserID: 123456789}
 			pending := &session.PendingPlan{
 				ID:             "plan-1",
 				IdempotencyKey: "idem-1",
@@ -215,5 +205,33 @@ func TestRuntimeACPExecutorMapsTransientAndPolicy(t *testing.T) {
 				t.Fatalf("expected %v, got %v", tc.expectErr, err)
 			}
 		})
+	}
+}
+
+func TestRuntimeACPExecutorRequiresTelegramUserID(t *testing.T) {
+	runner := &fakeRunSubmitter{}
+	executor, err := NewRuntimeACPExecutor("https://bookably.test", "svc-key", runner)
+	if err != nil {
+		t.Fatalf("NewRuntimeACPExecutor: %v", err)
+	}
+
+	s := &session.Session{ChatID: 14, ProviderID: "spec-1"}
+	pending := &session.PendingPlan{
+		ID:             "plan-1",
+		IdempotencyKey: "idem-1",
+		Plan: interpreter.ActionPlan{
+			Intent: interpreter.IntentCancelBooking,
+			Params: interpreter.ActionParams{
+				BookingID: "b-1",
+			},
+		},
+	}
+
+	_, err = executor.ExecuteConfirmed(context.Background(), s, pending)
+	if err == nil {
+		t.Fatal("expected error when telegram_user_id is missing")
+	}
+	if !errors.Is(err, domain.ErrValidation) {
+		t.Fatalf("expected ErrValidation, got %v", err)
 	}
 }

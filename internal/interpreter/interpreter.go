@@ -24,6 +24,13 @@ type ConversationContext struct {
 	History  []Turn
 }
 
+type Progress struct {
+	ChunkCount int
+	Bytes      int64
+	StartedAt  time.Time
+	UpdatedAt  time.Time
+}
+
 type Interpreter struct {
 	llmClient  llm.LLMClient
 	promptPath string
@@ -49,6 +56,10 @@ func New(llmClient llm.LLMClient, promptPath string, timeout time.Duration) (*In
 }
 
 func (i *Interpreter) Interpret(ctx context.Context, userMessage string, convo ConversationContext) (*ActionPlan, error) {
+	return i.InterpretWithProgress(ctx, userMessage, convo, nil)
+}
+
+func (i *Interpreter) InterpretWithProgress(ctx context.Context, userMessage string, convo ConversationContext, onProgress func(Progress)) (*ActionPlan, error) {
 	if i == nil {
 		return nil, fmt.Errorf("interpreter: interpreter is nil")
 	}
@@ -84,9 +95,27 @@ func (i *Interpreter) Interpret(ctx context.Context, userMessage string, convo C
 	callCtx, cancel := context.WithTimeout(ctx, i.timeout)
 	defer cancel()
 
-	completion, err := i.llmClient.Complete(callCtx, messages)
-	if err != nil {
-		return nil, fmt.Errorf("interpreter: llm complete: %w", err)
+	var (
+		completion *llm.Completion
+		llmErr     error
+	)
+	if streamingClient, ok := i.llmClient.(llm.StreamingClient); ok {
+		completion, llmErr = streamingClient.CompleteStream(callCtx, messages, func(progress llm.StreamProgress) {
+			if onProgress == nil {
+				return
+			}
+			onProgress(Progress{
+				ChunkCount: progress.ChunkCount,
+				Bytes:      progress.Bytes,
+				StartedAt:  progress.StartedAt,
+				UpdatedAt:  progress.UpdatedAt,
+			})
+		})
+	} else {
+		completion, llmErr = i.llmClient.Complete(callCtx, messages)
+	}
+	if llmErr != nil {
+		return nil, fmt.Errorf("interpreter: llm complete: %w", llmErr)
 	}
 
 	plan, err := ParseActionPlan(completion.Content)
