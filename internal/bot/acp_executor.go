@@ -83,6 +83,25 @@ func (e *RuntimeACPExecutor) ExecuteConfirmed(ctx context.Context, s *session.Se
 		RawMessage:   strings.TrimSpace(pending.Plan.RawUserMessage),
 	}
 
+	if shouldExecuteDirectFirst(pending.Plan.Intent) {
+		if err := e.executeDirectBookably(ctx, s, pending); err != nil {
+			e.logError(s, pending, started, classifyExecutionErrorType(err), err, map[string]any{
+				"stage": "direct_primary",
+			})
+			switch {
+			case errors.Is(err, domain.ErrUpstream), errors.Is(err, domain.ErrRateLimit):
+				return nil, errors.Join(ErrExecutionTransient, err)
+			default:
+				return nil, err
+			}
+		}
+		msg := successMessageForIntent(pending.Plan.Intent)
+		if strings.TrimSpace(msg) == "" {
+			msg = "Готово. Изменения применены."
+		}
+		return &ExecutionResult{Message: msg}, nil
+	}
+
 	run, err := e.buildRun(s.TelegramUserID, pending, meta, s.Timezone)
 	if err != nil {
 		errType := "ErrValidation"
@@ -146,6 +165,15 @@ func shouldFallbackDirect(err error) bool {
 func canDirectExecute(intent interpreter.Intent) bool {
 	switch intent {
 	case interpreter.IntentCancelBooking, interpreter.IntentSetWorkingHours, interpreter.IntentAddBreak, interpreter.IntentCloseRange:
+		return true
+	default:
+		return false
+	}
+}
+
+func shouldExecuteDirectFirst(intent interpreter.Intent) bool {
+	switch intent {
+	case interpreter.IntentSetWorkingHours, interpreter.IntentAddBreak, interpreter.IntentCloseRange:
 		return true
 	default:
 		return false

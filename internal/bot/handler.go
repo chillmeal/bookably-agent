@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -28,6 +29,9 @@ var (
 	ErrExecutionPolicyViolation = errors.New("bot handler: execution policy violation")
 	ErrExecutionTransient       = errors.New("bot handler: execution transient")
 	ErrExecutionContractBlocked = errors.New("bot handler: execution contract blocked")
+	reCancelClock               = regexp.MustCompile(`\b([01]?\d|2[0-3])[:. ]([0-5]\d)\b`)
+	reCancelNumericDate         = regexp.MustCompile(`\b(\d{1,2})[./](\d{1,2})(?:[./](\d{2,4}))?\b`)
+	reCancelTextDate            = regexp.MustCompile(`\b(\d{1,2})\s+(январ[ья]|феврал[ья]|март[а]?|апрел[ья]|ма[йя]|июн[ья]|июл[ья]|август[а]?|сентябр[ья]|октябр[ья]|ноябр[ья]|декабр[ья])\b`)
 )
 
 type HandlerConfig struct {
@@ -396,6 +400,10 @@ func (h *Handler) handleMessage(ctx context.Context, msg *telegramMessageUpdate)
 		return h.store.Save(ctx, s)
 	}
 
+	if plan.Intent == interpreter.IntentCancelBooking {
+		enrichCancelParamsFromMessage(&plan.Params, userMessage, s.Timezone, h.clock())
+	}
+
 	AppendHistory(s, "user", userMessage)
 
 	if plan.Intent == interpreter.IntentUnknown || plan.Confidence < 0.5 {
@@ -575,11 +583,7 @@ func (h *Handler) newStreamProgressReporter(ctx context.Context, chatID int64) (
 
 func (h *Handler) handleListBookings(ctx context.Context, s *session.Session, plan *interpreter.ActionPlan) error {
 	chatID := s.ChatID
-	if isLongRange(plan.Params.DateRange, s.Timezone) {
-		return h.sendDeepLinkEscalation(ctx, s, chatID, "bookings", "range_gt_7d")
-	}
-
-	filter, err := buildBookingFilter(plan.Params, s.Timezone, h.clock())
+	filter, clampedToWeek, err := buildBookingFilter(plan.Params, s.Timezone, h.clock())
 	if err != nil {
 		h.logError(chatID, string(plan.Intent), "bot/handler", time.Now(), errorKind(err), err, map[string]any{"stage": "build_booking_filter"})
 		if _, sendErr := h.telegram.SendText(ctx, chatID, FormatError(errorKind(err)), nil); sendErr != nil {
@@ -602,7 +606,18 @@ func (h *Handler) handleListBookings(ctx context.Context, s *session.Session, pl
 		location = time.UTC
 	}
 	text := FormatBookingListPreview(bookings, location)
-	if _, err := h.telegram.Finalize(ctx, chatID, text, nil); err != nil {
+	var keyboard *InlineKeyboardMarkup
+	if clampedToWeek {
+		text += "\n\n" + renderBody("Показал ближайшие 7 дней. Если нужен более широкий период, можно открыть приложение.")
+		link := h.BuildDeepLink("bookings", "range_gt_7d")
+		markup := InlineKeyboardMarkup{
+			InlineKeyboard: [][]InlineKeyboardButton{
+				{NewWebAppButton("Открыть в приложении →", link)},
+			},
+		}
+		keyboard = &markup
+	}
+	if _, err := h.telegram.Finalize(ctx, chatID, text, keyboard); err != nil {
 		return err
 	}
 
@@ -1154,6 +1169,155 @@ func hasCancelDateContext(p interpreter.ActionParams) bool {
 	return false
 }
 
+func enrichCancelParamsFromMessage(params *interpreter.ActionParams, rawMessage, tzName string, now time.Time) {
+	if params == nil {
+		return
+	}
+	text := strings.TrimSpace(strings.ToLower(rawMessage))
+	if text == "" {
+		return
+	}
+	if hasCancelDateContext(*params) {
+		return
+	}
+
+	loc := time.UTC
+	if strings.TrimSpace(tzName) != "" {
+		if loaded, err := time.LoadLocation(strings.TrimSpace(tzName)); err == nil {
+			loc = loaded
+		}
+	}
+
+	date, ok := parseCancelDateFromText(text, now.In(loc), loc)
+	if ok {
+		dateValue := date.Format("2006-01-02")
+		params.DateRange = &interpreter.DateRange{From: dateValue, To: dateValue}
+	}
+
+	clockMatch := reCancelClock.FindStringSubmatch(text)
+	if len(clockMatch) == 3 && params.DateRange != nil {
+		hours := strings.TrimSpace(clockMatch[1])
+		minutes := strings.TrimSpace(clockMatch[2])
+		if len(hours) == 1 {
+			hours = "0" + hours
+		}
+		clock := fmt.Sprintf("%s:%s", hours, minutes)
+		if ts, err := time.ParseInLocation("2006-01-02 15:04", params.DateRange.From+" "+clock, loc); err == nil {
+			params.ApproximateTime = ts.UTC().Format(time.RFC3339)
+		}
+	}
+}
+
+func parseCancelDateFromText(text string, now time.Time, loc *time.Location) (time.Time, bool) {
+	if loc == nil {
+		loc = time.UTC
+	}
+
+	if match := reCancelNumericDate.FindStringSubmatch(text); len(match) >= 3 {
+		day, dayErr := parseTwoDigitNumber(match[1], 1, 31)
+		month, monthErr := parseTwoDigitNumber(match[2], 1, 12)
+		if dayErr == nil && monthErr == nil {
+			year := now.Year()
+			if strings.TrimSpace(match[3]) != "" {
+				if y, yErr := parseYearNumber(match[3]); yErr == nil {
+					year = y
+				}
+			}
+			candidate := time.Date(year, time.Month(month), day, 0, 0, 0, 0, loc)
+			if strings.TrimSpace(match[3]) == "" && candidate.Before(now.AddDate(0, -1, 0)) {
+				candidate = candidate.AddDate(1, 0, 0)
+			}
+			return candidate, true
+		}
+	}
+
+	if match := reCancelTextDate.FindStringSubmatch(text); len(match) >= 3 {
+		day, dayErr := parseTwoDigitNumber(match[1], 1, 31)
+		month, ok := parseRuMonth(match[2])
+		if dayErr == nil && ok {
+			candidate := time.Date(now.Year(), time.Month(month), day, 0, 0, 0, 0, loc)
+			if candidate.Before(now.AddDate(0, -1, 0)) {
+				candidate = candidate.AddDate(1, 0, 0)
+			}
+			return candidate, true
+		}
+	}
+
+	if strings.Contains(text, "сегодня") {
+		return time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc), true
+	}
+	if strings.Contains(text, "завтра") {
+		value := now.AddDate(0, 0, 1)
+		return time.Date(value.Year(), value.Month(), value.Day(), 0, 0, 0, 0, loc), true
+	}
+	if strings.Contains(text, "послезавтра") {
+		value := now.AddDate(0, 0, 2)
+		return time.Date(value.Year(), value.Month(), value.Day(), 0, 0, 0, 0, loc), true
+	}
+	return time.Time{}, false
+}
+
+func parseTwoDigitNumber(raw string, min int, max int) (int, error) {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return 0, errors.New("empty")
+	}
+	parsed := 0
+	for _, r := range value {
+		if r < '0' || r > '9' {
+			return 0, errors.New("non-digit")
+		}
+		parsed = parsed*10 + int(r-'0')
+	}
+	if parsed < min || parsed > max {
+		return 0, errors.New("out-of-range")
+	}
+	return parsed, nil
+}
+
+func parseYearNumber(raw string) (int, error) {
+	year, err := parseTwoDigitNumber(raw, 0, 9999)
+	if err != nil {
+		return 0, err
+	}
+	if year < 100 {
+		return 2000 + year, nil
+	}
+	return year, nil
+}
+
+func parseRuMonth(raw string) (int, bool) {
+	value := strings.TrimSpace(strings.ToLower(raw))
+	switch {
+	case strings.HasPrefix(value, "январ"):
+		return 1, true
+	case strings.HasPrefix(value, "феврал"):
+		return 2, true
+	case strings.HasPrefix(value, "март"):
+		return 3, true
+	case strings.HasPrefix(value, "апрел"):
+		return 4, true
+	case strings.HasPrefix(value, "ма"):
+		return 5, true
+	case strings.HasPrefix(value, "июн"):
+		return 6, true
+	case strings.HasPrefix(value, "июл"):
+		return 7, true
+	case strings.HasPrefix(value, "август"):
+		return 8, true
+	case strings.HasPrefix(value, "сентябр"):
+		return 9, true
+	case strings.HasPrefix(value, "октябр"):
+		return 10, true
+	case strings.HasPrefix(value, "ноябр"):
+		return 11, true
+	case strings.HasPrefix(value, "декабр"):
+		return 12, true
+	default:
+		return 0, false
+	}
+}
+
 func humanAvailabilityIntentSummary(intent interpreter.Intent, p interpreter.ActionParams, tz *time.Location) string {
 	if p.DateRange == nil || strings.TrimSpace(p.DateRange.From) == "" {
 		return ""
@@ -1268,7 +1432,7 @@ func (h *Handler) hydrateSessionProviderInfo(ctx context.Context, s *session.Ses
 	return nil
 }
 
-func buildBookingFilter(params interpreter.ActionParams, tzName string, now time.Time) (domain.BookingFilter, error) {
+func buildBookingFilter(params interpreter.ActionParams, tzName string, now time.Time) (domain.BookingFilter, bool, error) {
 	loc := time.UTC
 	if strings.TrimSpace(tzName) != "" {
 		if l, err := time.LoadLocation(tzName); err == nil {
@@ -1276,31 +1440,50 @@ func buildBookingFilter(params interpreter.ActionParams, tzName string, now time
 		}
 	}
 
+	status := strings.TrimSpace(params.Status)
+	if status == "" {
+		status = "upcoming"
+	}
+
 	from := now.In(loc)
 	to := from
+	hadExplicitRange := false
 	if params.DateRange != nil && strings.TrimSpace(params.DateRange.From) != "" {
+		hadExplicitRange = true
 		parsedFrom, err := time.ParseInLocation("2006-01-02", params.DateRange.From, loc)
 		if err != nil {
-			return domain.BookingFilter{}, errors.Join(domain.ErrValidation, err)
+			return domain.BookingFilter{}, false, errors.Join(domain.ErrValidation, err)
 		}
 		from = parsedFrom
 		if strings.TrimSpace(params.DateRange.To) != "" {
 			parsedTo, err := time.ParseInLocation("2006-01-02", params.DateRange.To, loc)
 			if err != nil {
-				return domain.BookingFilter{}, errors.Join(domain.ErrValidation, err)
+				return domain.BookingFilter{}, false, errors.Join(domain.ErrValidation, err)
 			}
 			to = parsedTo
 		} else {
 			to = parsedFrom
 		}
+	} else {
+		switch strings.ToLower(status) {
+		case "past":
+			to = from
+			from = from.AddDate(0, 0, -6)
+		default:
+			to = from.AddDate(0, 0, 6)
+		}
+	}
+
+	clampedToWeek := false
+	if hadExplicitRange {
+		if spanDays := int(to.Sub(from).Hours()/24) + 1; spanDays > 7 {
+			to = from.AddDate(0, 0, 6)
+			clampedToWeek = true
+		}
 	}
 
 	start := time.Date(from.Year(), from.Month(), from.Day(), 0, 0, 0, 0, loc).UTC()
 	end := time.Date(to.Year(), to.Month(), to.Day(), 23, 59, 59, 0, loc).UTC()
-	status := strings.TrimSpace(params.Status)
-	if status == "" {
-		status = "upcoming"
-	}
 	direction := "future"
 	if strings.EqualFold(status, "past") {
 		direction = "past"
@@ -1311,7 +1494,7 @@ func buildBookingFilter(params interpreter.ActionParams, tzName string, now time
 		Status:    status,
 		Direction: direction,
 		Limit:     50,
-	}, nil
+	}, clampedToWeek, nil
 }
 
 func buildSlotSearchRequest(params interpreter.ActionParams, now time.Time) (domain.SlotSearchRequest, error) {

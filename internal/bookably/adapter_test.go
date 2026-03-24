@@ -209,15 +209,17 @@ func TestPreviewAvailabilityChange_NoWriteCallsAndConflict(t *testing.T) {
 		}
 
 		switch r.URL.Path {
+		case endpointPublicSpecialistProfile:
+			_, _ = io.WriteString(w, `{"specialist":{"id":"spec-1","timezone":"Europe/Moscow"}}`)
 		case endpointSpecialistSlots:
 			_, _ = io.WriteString(w, `{"slots":[
-				{"id":"sl1","startAt":"2026-03-24T10:00:00Z","endAt":"2026-03-24T11:00:00Z"},
-				{"id":"sl2","startAt":"2026-03-24T11:00:00Z","endAt":"2026-03-24T12:00:00Z"},
-				{"id":"sl3","startAt":"2026-03-24T12:00:00Z","endAt":"2026-03-24T13:00:00Z"}
+				{"id":"sl1","startAt":"2026-03-24T07:00:00Z","endAt":"2026-03-24T08:00:00Z"},
+				{"id":"sl2","startAt":"2026-03-24T08:00:00Z","endAt":"2026-03-24T09:00:00Z"},
+				{"id":"sl3","startAt":"2026-03-24T09:00:00Z","endAt":"2026-03-24T10:00:00Z"}
 			]}`)
 		case endpointSpecialistBookings:
 			_, _ = io.WriteString(w, `{"bookings":[
-				{"id":"b1","publicId":"BK-1","status":"CONFIRMED","client":{"firstName":"Алина","lastName":"Смирнова"},"service":{"title":"Массаж"},"slot":{"id":"x","startAt":"2026-03-24T11:00:00Z","endAt":"2026-03-24T12:00:00Z"}}
+				{"id":"b1","publicId":"BK-1","status":"CONFIRMED","client":{"firstName":"Алина","lastName":"Смирнова"},"service":{"title":"Массаж"},"slot":{"id":"x","startAt":"2026-03-24T08:00:00Z","endAt":"2026-03-24T09:00:00Z"}}
 			]}`)
 		default:
 			w.WriteHeader(http.StatusNotFound)
@@ -288,16 +290,19 @@ func TestPreviewBookingCreate(t *testing.T) {
 func TestPreviewBookingCancelSingleMultipleAndNotFound(t *testing.T) {
 	var queries []url.Values
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != endpointSpecialistBookings {
-			w.WriteHeader(http.StatusNotFound)
-			return
-		}
-		queries = append(queries, r.URL.Query())
-		_, _ = io.WriteString(w, `{"bookings":[
+		switch r.URL.Path {
+		case endpointPublicSpecialistProfile:
+			_, _ = io.WriteString(w, `{"specialist":{"id":"spec-1","timezone":"Europe/Moscow"}}`)
+		case endpointSpecialistBookings:
+			queries = append(queries, r.URL.Query())
+			_, _ = io.WriteString(w, `{"bookings":[
 			{"id":"b1","status":"CONFIRMED","client":{"firstName":"Иван","lastName":"Петров"},"service":{"title":"Стрижка"},"slot":{"startAt":"2026-03-27T11:00:00Z","endAt":"2026-03-27T11:30:00Z"}},
 			{"id":"b2","status":"CONFIRMED","client":{"firstName":"Марина"},"service":{"title":"Маникюр"},"slot":{"startAt":"2026-03-28T14:00:00Z","endAt":"2026-03-28T15:00:00Z"}},
 			{"id":"b3","status":"CONFIRMED","client":{"firstName":"Марина"},"service":{"title":"Педикюр"},"slot":{"startAt":"2026-04-01T11:30:00Z","endAt":"2026-04-01T12:30:00Z"}}
 		]}`)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
 	}))
 	defer server.Close()
 
@@ -350,14 +355,17 @@ func TestPreviewBookingCancelSingleMultipleAndNotFound(t *testing.T) {
 
 func TestPreviewBookingCancelDateFirstFiltersByApproximateTime(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != endpointSpecialistBookings {
-			w.WriteHeader(http.StatusNotFound)
-			return
-		}
-		_, _ = io.WriteString(w, `{"bookings":[
+		switch r.URL.Path {
+		case endpointPublicSpecialistProfile:
+			_, _ = io.WriteString(w, `{"specialist":{"id":"spec-1","timezone":"Europe/Moscow"}}`)
+		case endpointSpecialistBookings:
+			_, _ = io.WriteString(w, `{"bookings":[
 			{"id":"b1","status":"CONFIRMED","client":{"firstName":"Иван"},"service":{"title":"Стрижка"},"slot":{"startAt":"2026-04-01T11:00:00Z","endAt":"2026-04-01T11:30:00Z"}},
 			{"id":"b2","status":"CONFIRMED","client":{"firstName":"Алина"},"service":{"title":"Массаж"},"slot":{"startAt":"2026-04-01T18:00:00Z","endAt":"2026-04-01T19:00:00Z"}}
 		]}`)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
 	}))
 	defer server.Close()
 
@@ -415,6 +423,8 @@ func TestGetBookingsQueryContainsUTCAndPaginationCursor(t *testing.T) {
 func TestPreviewAvailabilityChangeEmptyRange(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
+		case endpointPublicSpecialistProfile:
+			_, _ = io.WriteString(w, `{"specialist":{"id":"spec-1","timezone":"Europe/Moscow"}}`)
 		case endpointSpecialistSlots:
 			_, _ = io.WriteString(w, `{"slots":[]}`)
 		case endpointSpecialistBookings:
@@ -448,7 +458,7 @@ func TestBuildWorkingHoursSlots_InvalidBreakReturnsValidation(t *testing.T) {
 	_, err := buildWorkingHoursSlots(from, to, domain.ActionParams{
 		WorkingHours: &domain.TimeRange{From: "10:00", To: "18:00"},
 		Breaks:       []domain.TimeRange{{From: "08:00", To: "09:00"}},
-	}, time.Hour)
+	}, time.Hour, time.UTC)
 	if err == nil {
 		t.Fatal("expected validation error for break outside working hours")
 	}

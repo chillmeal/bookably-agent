@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -26,6 +27,10 @@ func (f *fakeRunSubmitter) SubmitAndWait(ctx context.Context, run acp.ACPRun) (*
 		return f.fn(ctx, run)
 	}
 	return &acp.ACPRunResult{RunID: "run-1", Status: acp.ACPStatusCompleted}, nil
+}
+
+func (f *fakeRunSubmitter) wasCalled() bool {
+	return len(f.lastRun.Steps) > 0 || strings.TrimSpace(f.lastRun.IdempotencyKey) != ""
 }
 
 func TestRuntimeACPExecutorCancelRunShape(t *testing.T) {
@@ -109,10 +114,29 @@ func TestRuntimeACPExecutorCreateBookingIsContractBlocked(t *testing.T) {
 	}
 }
 
-func TestRuntimeACPExecutorAvailabilityRunShape(t *testing.T) {
+func TestRuntimeACPExecutorAvailabilityDirectPrimary(t *testing.T) {
+	var calls int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		if r.Method != http.MethodPost {
+			t.Fatalf("expected POST, got %s", r.Method)
+		}
+		if r.URL.Path != "/api/v1/specialist/schedule/commit" {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		if got := r.Header.Get("X-Bot-Service-Key"); got != "svc-key" {
+			t.Fatalf("X-Bot-Service-Key mismatch: %q", got)
+		}
+		if got := r.Header.Get("X-Telegram-User-Id"); got != "987654321" {
+			t.Fatalf("X-Telegram-User-Id mismatch: %q", got)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
 	runner := &fakeRunSubmitter{}
 
-	executor, err := NewRuntimeACPExecutor("https://bookably.test", "svc-key", runner)
+	executor, err := NewRuntimeACPExecutor(server.URL, "svc-key", runner)
 	if err != nil {
 		t.Fatalf("NewRuntimeACPExecutor: %v", err)
 	}
@@ -138,22 +162,11 @@ func TestRuntimeACPExecutorAvailabilityRunShape(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ExecuteConfirmed: %v", err)
 	}
-	if len(runner.lastRun.Steps) != 1 {
-		t.Fatalf("expected 1 commit step, got %d", len(runner.lastRun.Steps))
+	if runner.wasCalled() {
+		t.Fatal("expected ACP runner to be skipped for availability direct-primary path")
 	}
-	step := runner.lastRun.Steps[0]
-	if step.Config.Method != "POST" || step.Capability != "availability.commit" {
-		t.Fatalf("unexpected availability step: %#v", step)
-	}
-	if step.Config.URL != "https://bookably.test/api/v1/specialist/schedule/commit" {
-		t.Fatalf("unexpected commit URL: %q", step.Config.URL)
-	}
-	body, ok := step.Config.Body.(acp.CommitScheduleBody)
-	if !ok {
-		t.Fatalf("expected CommitScheduleBody, got %T", step.Config.Body)
-	}
-	if len(body.Create) != 1 || len(body.Delete) != 1 {
-		t.Fatalf("unexpected availability body: %#v", body)
+	if atomic.LoadInt32(&calls) != 1 {
+		t.Fatalf("expected one direct schedule commit call, got %d", calls)
 	}
 }
 
