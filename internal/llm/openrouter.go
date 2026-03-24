@@ -17,7 +17,7 @@ import (
 
 const (
 	defaultOpenRouterBaseURL = "https://openrouter.ai/api/v1"
-	defaultOpenRouterModel   = "openai/gpt-5.4-nano"
+	defaultOpenRouterModel   = "openai/gpt-5.4-mini"
 )
 
 type OpenRouterClient struct {

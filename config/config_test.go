@@ -47,7 +47,7 @@ func setBaseEnv(t *testing.T) {
 	t.Setenv("BOOKABLY_BOT_SERVICE_KEY", "bot-service-key")
 	t.Setenv("LLM_PROVIDER", "openrouter")
 	t.Setenv("LLM_API_KEY", "llm-key")
-	t.Setenv("LLM_MODEL", "openai/gpt-5.4-nano")
+	t.Setenv("LLM_MODEL", "openai/gpt-5.4-mini")
 	t.Setenv("MINI_APP_URL", "https://t.me/bookably_bot/app")
 	t.Setenv("PORT", "8080")
 	t.Setenv("LOG_LEVEL", "debug")
@@ -152,7 +152,7 @@ func TestLoadConfig_ValidEnv(t *testing.T) {
 	if cfg.LLMAPIKey != "llm-key" {
 		t.Fatalf("LLMAPIKey mismatch: %q", cfg.LLMAPIKey)
 	}
-	if cfg.LLMModel != "openai/gpt-5.4-nano" {
+	if cfg.LLMModel != "openai/gpt-5.4-mini" {
 		t.Fatalf("LLMModel mismatch: %q", cfg.LLMModel)
 	}
 	if cfg.MiniAppURL != "https://t.me/bookably_bot/app" {
@@ -243,8 +243,8 @@ func TestLoadConfig_OpenRouterDefaultsModel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load() unexpected error: %v", err)
 	}
-	if cfg.LLMModel != "openai/gpt-5.4-nano" {
-		t.Fatalf("expected LLM_MODEL default openai/gpt-5.4-nano, got %q", cfg.LLMModel)
+	if cfg.LLMModel != "openai/gpt-5.4-mini" {
+		t.Fatalf("expected LLM_MODEL default openai/gpt-5.4-mini, got %q", cfg.LLMModel)
 	}
 }
 
@@ -258,7 +258,7 @@ func TestLoadConfig_OpenRouterRejectsNonStrictModel(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected strict model policy error for openrouter")
 	}
-	if !strings.Contains(err.Error(), "LLM_MODEL=openai/gpt-5.4-nano") {
+	if !strings.Contains(err.Error(), "LLM_MODEL=openai/gpt-5.4-mini") {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
