@@ -941,7 +941,7 @@ func (h *Handler) handleBookingSelection(ctx context.Context, s *session.Session
 			At:          at.UTC(),
 		},
 	}
-	text := FormatCancelPreview(preview)
+	text := FormatCancelPreview(preview, location)
 	keyboard := BuildPreviewKeyboard(pending.ID)
 	msgID, finalizeErr := h.telegram.Finalize(ctx, s.ChatID, text, &keyboard)
 	if finalizeErr != nil {
@@ -1063,7 +1063,7 @@ func formatPreviewByIntent(preview domain.Preview, intent interpreter.Intent, tz
 	case interpreter.IntentCreateBooking:
 		return FormatCreatePreview(preview, tz)
 	case interpreter.IntentCancelBooking:
-		return FormatCancelPreview(preview)
+		return FormatCancelPreview(preview, tz)
 	default:
 		return FormatAvailabilityPreview(preview)
 	}

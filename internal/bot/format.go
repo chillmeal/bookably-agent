@@ -104,9 +104,13 @@ func FormatBookingListPreview(bookings []domain.Booking, tz *time.Location) stri
 	return renderBody(strings.TrimSpace(b.String()))
 }
 
-func FormatCancelPreview(preview domain.Preview) string {
+func FormatCancelPreview(preview domain.Preview, tz *time.Location) string {
 	if preview.BookingResult == nil {
 		return renderBody(boldLead("Не получилось однозначно определить запись для отмены") + "Уточни клиента или время.")
+	}
+	loc := tz
+	if loc == nil {
+		loc = time.UTC
 	}
 
 	bk := preview.BookingResult
@@ -119,7 +123,7 @@ func FormatCancelPreview(preview domain.Preview) string {
 	b.WriteString(boldText(fallbackValue(bk.ServiceName, "Услуга")))
 	b.WriteString("\n")
 	b.WriteString("• Время: ")
-	b.WriteString(boldText(humanDateTime(bk.At, time.UTC)))
+	b.WriteString(boldText(humanDateTime(bk.At, loc)))
 	b.WriteString("\n\n⚠️ Отмена необратима.")
 	return renderBody(strings.TrimSpace(b.String()))
 }

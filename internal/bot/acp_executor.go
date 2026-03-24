@@ -1,9 +1,14 @@
 package bot
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -22,6 +27,7 @@ type RuntimeACPExecutor struct {
 	bookablyBaseURL string
 	botServiceKey   string
 	runner          ACPRunSubmitter
+	httpClient      *http.Client
 	logger          *observability.Logger
 }
 
@@ -39,6 +45,7 @@ func NewRuntimeACPExecutor(bookablyBaseURL, botServiceKey string, runner ACPRunS
 		bookablyBaseURL: strings.TrimRight(strings.TrimSpace(bookablyBaseURL), "/"),
 		botServiceKey:   strings.TrimSpace(botServiceKey),
 		runner:          runner,
+		httpClient:      &http.Client{Timeout: 8 * time.Second},
 		logger:          observability.NewLogger(nil),
 	}, nil
 }
@@ -88,6 +95,19 @@ func (e *RuntimeACPExecutor) ExecuteConfirmed(ctx context.Context, s *session.Se
 
 	result, runErr := e.runner.SubmitAndWait(ctx, *run)
 	if runErr != nil {
+		if shouldFallbackDirect(runErr) && canDirectExecute(pending.Plan.Intent) {
+			if directErr := e.executeDirectBookably(ctx, s, pending); directErr == nil {
+				msg := successMessageForIntent(pending.Plan.Intent)
+				if strings.TrimSpace(msg) == "" {
+					msg = "Готово. Изменения применены."
+				}
+				return &ExecutionResult{Message: msg}, nil
+			} else {
+				e.logError(s, pending, started, classifyExecutionErrorType(directErr), directErr, map[string]any{
+					"stage": "direct_fallback",
+				})
+			}
+		}
 		e.logError(s, pending, started, classifyExecutionErrorType(runErr), runErr, map[string]any{"stage": "submit_and_wait"})
 		switch {
 		case errors.Is(runErr, acp.ErrACPPolicyViolation):
@@ -107,6 +127,131 @@ func (e *RuntimeACPExecutor) ExecuteConfirmed(ctx context.Context, s *session.Se
 		msg = "Готово\\. Изменения применены\\."
 	}
 	return &ExecutionResult{Message: msg}, nil
+}
+
+func shouldFallbackDirect(err error) bool {
+	if err == nil {
+		return false
+	}
+	raw := strings.ToLower(strings.TrimSpace(err.Error()))
+	if strings.Contains(raw, "agent_id") && strings.Contains(raw, "must not be empty") {
+		return true
+	}
+	if strings.Contains(raw, "policy_contract_addr") && strings.Contains(raw, "must not be empty") {
+		return true
+	}
+	return false
+}
+
+func canDirectExecute(intent interpreter.Intent) bool {
+	switch intent {
+	case interpreter.IntentCancelBooking, interpreter.IntentSetWorkingHours, interpreter.IntentAddBreak, interpreter.IntentCloseRange:
+		return true
+	default:
+		return false
+	}
+}
+
+func (e *RuntimeACPExecutor) executeDirectBookably(ctx context.Context, s *session.Session, pending *session.PendingPlan) error {
+	switch pending.Plan.Intent {
+	case interpreter.IntentCancelBooking:
+		bookingID := strings.TrimSpace(pending.Plan.Params.BookingID)
+		if bookingID == "" {
+			return errors.Join(domain.ErrValidation, errors.New("bot acp executor: booking_id is required for direct cancel"))
+		}
+		endpoint := fmt.Sprintf("%s/api/v1/specialist/bookings/%s/cancel", e.bookablyBaseURL, bookingID)
+		return e.doDirectRequest(ctx, http.MethodPost, endpoint, s.TelegramUserID, pending.IdempotencyKey, nil)
+	case interpreter.IntentSetWorkingHours, interpreter.IntentAddBreak, interpreter.IntentCloseRange:
+		create, deleteIDs, err := buildAvailabilityCommitPayload(pending, s.Timezone)
+		if err != nil {
+			return err
+		}
+		body := acp.CommitScheduleBody{
+			Create: create,
+			Delete: make([]acp.CommitDeleteItem, 0, len(deleteIDs)),
+		}
+		for _, id := range deleteIDs {
+			body.Delete = append(body.Delete, acp.CommitDeleteItem{SlotID: id})
+		}
+		endpoint := fmt.Sprintf("%s/api/v1/specialist/schedule/commit", e.bookablyBaseURL)
+		return e.doDirectRequest(ctx, http.MethodPost, endpoint, s.TelegramUserID, pending.IdempotencyKey+":commit", body)
+	default:
+		return errors.Join(ErrExecutionContractBlocked, fmt.Errorf("bot acp executor: direct execution is unsupported for intent %q", pending.Plan.Intent))
+	}
+}
+
+func (e *RuntimeACPExecutor) doDirectRequest(ctx context.Context, method, url string, telegramUserID int64, idempotencyKey string, body any) error {
+	if e.httpClient == nil {
+		e.httpClient = &http.Client{Timeout: 8 * time.Second}
+	}
+	var reader io.Reader
+	if body != nil {
+		payload, err := json.Marshal(body)
+		if err != nil {
+			return errors.Join(domain.ErrValidation, fmt.Errorf("bot acp executor: marshal direct payload: %w", err))
+		}
+		reader = bytes.NewReader(payload)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, method, url, reader)
+	if err != nil {
+		return errors.Join(domain.ErrValidation, fmt.Errorf("bot acp executor: build direct request: %w", err))
+	}
+	req.Header.Set("X-Bot-Service-Key", e.botServiceKey)
+	req.Header.Set("X-Telegram-User-Id", strconv.FormatInt(telegramUserID, 10))
+	req.Header.Set("Idempotency-Key", strings.TrimSpace(idempotencyKey))
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+
+	resp, err := e.httpClient.Do(req)
+	if err != nil {
+		return errors.Join(domain.ErrUpstream, fmt.Errorf("bot acp executor: direct request failed: %w", err))
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		return nil
+	}
+	return mapDirectHTTPError(resp.StatusCode, respBody)
+}
+
+func mapDirectHTTPError(status int, body []byte) error {
+	type envelope struct {
+		Error struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	var out envelope
+	_ = json.Unmarshal(body, &out)
+	msg := strings.TrimSpace(out.Error.Message)
+	if msg == "" {
+		msg = strings.TrimSpace(string(body))
+	}
+	if msg == "" {
+		msg = fmt.Sprintf("http status %d", status)
+	}
+	switch status {
+	case http.StatusUnauthorized:
+		return errors.Join(domain.ErrUnauthorized, errors.New(msg))
+	case http.StatusForbidden:
+		return errors.Join(domain.ErrForbidden, errors.New(msg))
+	case http.StatusNotFound:
+		return errors.Join(domain.ErrNotFound, errors.New(msg))
+	case http.StatusConflict:
+		return errors.Join(domain.ErrConflict, errors.New(msg))
+	case http.StatusUnprocessableEntity, http.StatusBadRequest:
+		return errors.Join(domain.ErrValidation, errors.New(msg))
+	case http.StatusTooManyRequests:
+		return errors.Join(domain.ErrRateLimit, errors.New(msg))
+	default:
+		if status >= 500 {
+			return errors.Join(domain.ErrUpstream, errors.New(msg))
+		}
+		return errors.Join(domain.ErrValidation, errors.New(msg))
+	}
 }
 
 func (e *RuntimeACPExecutor) logError(s *session.Session, pending *session.PendingPlan, started time.Time, errType string, err error, fields map[string]any) {

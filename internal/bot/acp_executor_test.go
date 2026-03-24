@@ -3,6 +3,9 @@ package bot
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -233,5 +236,60 @@ func TestRuntimeACPExecutorRequiresTelegramUserID(t *testing.T) {
 	}
 	if !errors.Is(err, domain.ErrValidation) {
 		t.Fatalf("expected ErrValidation, got %v", err)
+	}
+}
+
+func TestRuntimeACPExecutorFallbackToDirectOnACPContractMismatch(t *testing.T) {
+	var calls int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		if r.Method != http.MethodPost {
+			t.Fatalf("expected POST, got %s", r.Method)
+		}
+		if r.URL.Path != "/api/v1/specialist/bookings/booking-123/cancel" {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		if got := r.Header.Get("X-Bot-Service-Key"); got != "svc-key" {
+			t.Fatalf("X-Bot-Service-Key mismatch: %q", got)
+		}
+		if got := r.Header.Get("X-Telegram-User-Id"); got != "123456789" {
+			t.Fatalf("X-Telegram-User-Id mismatch: %q", got)
+		}
+		if got := r.Header.Get("Idempotency-Key"); got != "idem-1" {
+			t.Fatalf("Idempotency-Key mismatch: %q", got)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	runner := &fakeRunSubmitter{
+		fn: func(ctx context.Context, run acp.ACPRun) (*acp.ACPRunResult, error) {
+			return nil, errors.New("acp client: submit run status 400: {\"error\":{\"code\":\"policy_violation\",\"message\":\"invalid input: agent_id (must not be empty)\"}}")
+		},
+	}
+	executor, err := NewRuntimeACPExecutor(server.URL, "svc-key", runner)
+	if err != nil {
+		t.Fatalf("NewRuntimeACPExecutor: %v", err)
+	}
+
+	s := &session.Session{ChatID: 21, ProviderID: "spec-1", TelegramUserID: 123456789}
+	pending := &session.PendingPlan{
+		ID:             "plan-1",
+		IdempotencyKey: "idem-1",
+		Plan: interpreter.ActionPlan{
+			Intent: interpreter.IntentCancelBooking,
+			Params: interpreter.ActionParams{BookingID: "booking-123"},
+		},
+	}
+
+	result, err := executor.ExecuteConfirmed(context.Background(), s, pending)
+	if err != nil {
+		t.Fatalf("ExecuteConfirmed: %v", err)
+	}
+	if result == nil || result.Message == "" {
+		t.Fatalf("expected success result, got %+v", result)
+	}
+	if atomic.LoadInt32(&calls) != 1 {
+		t.Fatalf("expected one direct fallback request, got %d", calls)
 	}
 }
