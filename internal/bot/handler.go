@@ -463,6 +463,7 @@ func (h *Handler) newStreamProgressReporter(ctx context.Context, chatID int64) (
 		onceStop   sync.Once
 		startedAt  = time.Now()
 		stageIndex int
+		disabled   bool
 	)
 
 	stages := []string{
@@ -475,6 +476,10 @@ func (h *Handler) newStreamProgressReporter(ctx context.Context, chatID int64) (
 
 	sendDraft := func(text, stage string) {
 		mu.Lock()
+		if disabled {
+			mu.Unlock()
+			return
+		}
 		now := time.Now()
 		if !lastAt.IsZero() && now.Sub(lastAt) < 1800*time.Millisecond {
 			mu.Unlock()
@@ -487,9 +492,16 @@ func (h *Handler) newStreamProgressReporter(ctx context.Context, chatID int64) (
 		mu.Unlock()
 
 		if err := h.telegram.Draft(ctx, chatID, text); err != nil {
+			mu.Lock()
+			disabled = true
+			lastAt = now
+			lastKey = text
+			mu.Unlock()
+
 			h.logError(chatID, "", "bot/handler", now, "ErrUpstream", err, map[string]any{
 				"event": "draft.failed",
 				"stage": stage,
+				"note":  "draft_disabled_for_request",
 			})
 			_ = h.telegram.SendChatAction(ctx, chatID, "typing")
 			return
