@@ -189,7 +189,7 @@ func TestOpenRouterStreamContextCanceledOrDeadline(t *testing.T) {
 	}
 }
 
-func TestOpenRouterDefaultModelAndStrictPolicy(t *testing.T) {
+func TestOpenRouterDefaultModelAndCustomModel(t *testing.T) {
 	client, err := NewOpenRouterClient("test-key", ClientOptions{})
 	if err != nil {
 		t.Fatalf("NewOpenRouterClient() unexpected error: %v", err)
@@ -198,12 +198,12 @@ func TestOpenRouterDefaultModelAndStrictPolicy(t *testing.T) {
 		t.Fatalf("expected default model %q, got %q", defaultOpenRouterModel, client.model)
 	}
 
-	_, err = NewOpenRouterClient("test-key", ClientOptions{Model: "openai/gpt-4o"})
-	if err == nil {
-		t.Fatal("expected strict model policy error")
+	client, err = NewOpenRouterClient("test-key", ClientOptions{Model: "openai/gpt-5.4-nano"})
+	if err != nil {
+		t.Fatalf("expected custom model to be accepted, got error: %v", err)
 	}
-	if !strings.Contains(err.Error(), "strict model policy") {
-		t.Fatalf("unexpected error: %v", err)
+	if client.model != "openai/gpt-5.4-nano" {
+		t.Fatalf("expected custom model, got %q", client.model)
 	}
 }
 

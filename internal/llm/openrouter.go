@@ -53,9 +53,6 @@ func NewOpenRouterClient(apiKey string, opts ClientOptions) (*OpenRouterClient, 
 	if model == "" {
 		model = defaultOpenRouterModel
 	}
-	if model != defaultOpenRouterModel {
-		return nil, fmt.Errorf("openrouter: strict model policy requires %q, got %q", defaultOpenRouterModel, model)
-	}
 
 	timeout := normalizeTimeout(opts.Timeout)
 	httpClient := opts.HTTPClient

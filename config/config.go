@@ -81,8 +81,8 @@ func Load() (*Config, error) {
 		model := strings.TrimSpace(c.LLMModel)
 		if model == "" {
 			c.LLMModel = "openai/gpt-5.4-mini"
-		} else if model != "openai/gpt-5.4-mini" {
-			return nil, fmt.Errorf("config: strict model policy for openrouter requires LLM_MODEL=openai/gpt-5.4-mini, got %q", c.LLMModel)
+		} else {
+			c.LLMModel = model
 		}
 	case "stub":
 		// LLM_API_KEY intentionally optional for stub mode.

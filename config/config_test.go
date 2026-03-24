@@ -248,17 +248,17 @@ func TestLoadConfig_OpenRouterDefaultsModel(t *testing.T) {
 	}
 }
 
-func TestLoadConfig_OpenRouterRejectsNonStrictModel(t *testing.T) {
+func TestLoadConfig_OpenRouterAllowsCustomModel(t *testing.T) {
 	setBaseEnv(t)
 	t.Setenv("LLM_PROVIDER", "openrouter")
 	t.Setenv("LLM_API_KEY", "or-key")
-	t.Setenv("LLM_MODEL", "openai/gpt-4o")
+	t.Setenv("LLM_MODEL", "openai/gpt-5.4-nano")
 
-	_, err := Load()
-	if err == nil {
-		t.Fatal("expected strict model policy error for openrouter")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() unexpected error: %v", err)
 	}
-	if !strings.Contains(err.Error(), "LLM_MODEL=openai/gpt-5.4-mini") {
-		t.Fatalf("unexpected error: %v", err)
+	if cfg.LLMModel != "openai/gpt-5.4-nano" {
+		t.Fatalf("expected custom LLM_MODEL preserved, got %q", cfg.LLMModel)
 	}
 }
