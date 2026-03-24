@@ -43,8 +43,9 @@ func LoadOrCreate(ctx context.Context, store session.SessionStore, chatID int64)
 }
 
 type PendingPlanOptions struct {
-	SlotCandidates []domain.Slot
-	Availability   *domain.AvailabilityExecutionPayload
+	SlotCandidates    []domain.Slot
+	BookingCandidates []domain.Booking
+	Availability      *domain.AvailabilityExecutionPayload
 }
 
 func SetPendingPlan(s *session.Session, plan interpreter.ActionPlan, msgID int64, idempKey string, opts *PendingPlanOptions) *session.PendingPlan {
@@ -63,6 +64,9 @@ func SetPendingPlan(s *session.Session, plan interpreter.ActionPlan, msgID int64
 	if opts != nil {
 		if len(opts.SlotCandidates) > 0 {
 			pending.SlotCandidates = toPendingSlotCandidates(opts.SlotCandidates)
+		}
+		if len(opts.BookingCandidates) > 0 {
+			pending.BookingCandidates = toPendingBookingCandidates(opts.BookingCandidates)
 		}
 		if opts.Availability != nil {
 			pending.Availability = toPendingAvailability(opts.Availability)
@@ -146,6 +150,7 @@ func toPendingAvailability(exec *domain.AvailabilityExecutionPayload) *session.P
 	out := &session.PendingAvailability{
 		Create:        make([]session.PendingAvailabilityCreate, 0, len(exec.CreateSlots)),
 		DeleteSlotIDs: make([]string, 0, len(exec.DeleteSlotIDs)),
+		Availability:  make([]session.PendingAvailabilityDay, 0, len(exec.Availability)),
 	}
 
 	for _, slot := range exec.CreateSlots {
@@ -166,8 +171,47 @@ func toPendingAvailability(exec *domain.AvailabilityExecutionPayload) *session.P
 		out.DeleteSlotIDs = append(out.DeleteSlotIDs, slotID)
 	}
 
-	if len(out.Create) == 0 && len(out.DeleteSlotIDs) == 0 {
+	for _, day := range exec.Availability {
+		date := strings.TrimSpace(day.Date)
+		if date == "" {
+			continue
+		}
+		pendingDay := session.PendingAvailabilityDay{
+			Date:   date,
+			Ranges: make([]session.PendingAvailabilityRange, 0, len(day.Ranges)),
+		}
+		for _, r := range day.Ranges {
+			startTime := strings.TrimSpace(r.StartTime)
+			endTime := strings.TrimSpace(r.EndTime)
+			if startTime == "" || endTime == "" {
+				continue
+			}
+			pendingDay.Ranges = append(pendingDay.Ranges, session.PendingAvailabilityRange{
+				StartTime: startTime,
+				EndTime:   endTime,
+			})
+		}
+		out.Availability = append(out.Availability, pendingDay)
+	}
+
+	if len(out.Create) == 0 && len(out.DeleteSlotIDs) == 0 && len(out.Availability) == 0 {
 		return nil
+	}
+	return out
+}
+
+func toPendingBookingCandidates(bookings []domain.Booking) []session.PendingBookingCandidate {
+	out := make([]session.PendingBookingCandidate, 0, len(bookings))
+	for _, booking := range bookings {
+		if strings.TrimSpace(booking.ID) == "" || booking.At.IsZero() {
+			continue
+		}
+		out = append(out, session.PendingBookingCandidate{
+			ID:          strings.TrimSpace(booking.ID),
+			ClientName:  strings.TrimSpace(booking.ClientName),
+			ServiceName: strings.TrimSpace(booking.ServiceName),
+			At:          booking.At.UTC().Format(time.RFC3339),
+		})
 	}
 	return out
 }

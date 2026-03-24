@@ -2,21 +2,18 @@ package bookably
 
 // API endpoints used by the Bookably adapter.
 const (
-	endpointAuthTMA              = "/api/v1/auth/tma"
-	endpointAuthRefresh          = "/api/v1/auth/refresh"
-	endpointMe                   = "/api/v1/me"
-	endpointSpecialistBookings   = "/api/v1/specialist/bookings"
-	endpointPublicSlots          = "/api/v1/public/slots"
-	endpointPublicServices       = "/api/v1/public/services"
+	endpointMe                      = "/api/v1/me"
+	endpointSpecialistBookings      = "/api/v1/specialist/bookings"
+	endpointPublicSlots             = "/api/v1/public/slots"
+	endpointPublicServices          = "/api/v1/public/services"
 	endpointPublicSpecialistProfile = "/api/v1/public/specialist/profile"
-	endpointSpecialistSlots      = "/api/v1/specialist/slots"
-	endpointSpecialistCommit     = "/api/v1/specialist/schedule/commit"
-	endpointPublicBookings       = "/api/v1/public/bookings"
-	endpointSpecialistBookCancel = "/api/v1/specialist/bookings/%s/cancel"
+	endpointSpecialistSlots         = "/api/v1/specialist/slots"
+	endpointSpecialistCommit        = "/api/v1/specialist/schedule/commit"
+	endpointPublicBookings          = "/api/v1/public/bookings"
+	endpointSpecialistBookCancel    = "/api/v1/specialist/bookings/%s/cancel"
 )
 
 const (
-	tokenKeyPrefix = "ba:token:"
 	prefsKeyPrefix = "ba:prefs:"
 )
 

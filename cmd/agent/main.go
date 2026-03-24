@@ -9,8 +9,10 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
+	_ "time/tzdata"
 
 	"github.com/chillmeal/bookably-agent/config"
 	"github.com/chillmeal/bookably-agent/internal/acp"
@@ -19,6 +21,7 @@ import (
 	"github.com/chillmeal/bookably-agent/internal/interpreter"
 	"github.com/chillmeal/bookably-agent/internal/llm"
 	"github.com/chillmeal/bookably-agent/internal/session"
+	"github.com/chillmeal/bookably-agent/observability"
 	"github.com/joho/godotenv"
 )
 
@@ -45,16 +48,13 @@ func run() error {
 	}()
 
 	sessionStore := session.NewRedisStore(redisClient, cfg.SessionTTL)
+	appLogger := observability.NewLogger(os.Stdout)
 
-	tokenStore, err := bookably.NewRedisTokenStore(redisClient, time.Hour)
+	bookablyClient, err := bookably.NewClient(cfg.BookablyAPIURL, cfg.BookablyBotServiceKey, nil, cfg.BookablyHTTPTimeout)
 	if err != nil {
 		return err
 	}
-	bookablyClient, err := bookably.NewClient(cfg.BookablyAPIURL, cfg.BookablySpecialistID, tokenStore, nil, cfg.BookablyHTTPTimeout)
-	if err != nil {
-		return err
-	}
-	provider, err := bookably.NewAdapter(bookablyClient, cfg.BookablySpecialistID, redisClient, 0)
+	provider, err := bookably.NewAdapter(bookablyClient, redisClient, 0)
 	if err != nil {
 		return err
 	}
@@ -81,14 +81,11 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	tokenProvider, err := bookably.NewAccessTokenProvider(tokenStore)
+	executor, err := bot.NewRuntimeACPExecutor(cfg.BookablyAPIURL, cfg.BookablyBotServiceKey, runner)
 	if err != nil {
 		return err
 	}
-	executor, err := bot.NewRuntimeACPExecutor(cfg.BookablyAPIURL, runner, tokenProvider)
-	if err != nil {
-		return err
-	}
+	executor.SetLogger(appLogger)
 
 	telegram, err := bot.NewAPIGateway(cfg.TelegramBotToken, nil, "")
 	if err != nil {
@@ -96,15 +93,17 @@ func run() error {
 	}
 
 	handler, err := bot.NewHandler(bot.HandlerConfig{
-		WebhookSecret:     cfg.TelegramWebhookSecret,
-		WebhookURL:        cfg.TelegramWebhookURL,
-		MiniAppURL:        cfg.MiniAppURL,
-		DefaultProviderID: cfg.BookablySpecialistID,
-		PlanTTL:           cfg.PlanTTL,
-	}, sessionStore, interp, provider, executor, &botTokenStoreBridge{store: tokenStore}, telegram)
+		WebhookSecret: cfg.TelegramWebhookSecret,
+		WebhookURL:    cfg.TelegramWebhookURL,
+		MiniAppURL:    cfg.MiniAppURL,
+		PlanTTL:       cfg.PlanTTL,
+		WorkerTimeout: cfg.WorkerTimeout,
+	}, sessionStore, interp, provider, executor, telegram)
 	if err != nil {
 		return err
 	}
+	handler.SetLogger(appLogger)
+	logACPAvailability(cfg.ACPBaseURL, cfg.ACPAPIKey, appLogger)
 
 	registerCtx, cancelRegister := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancelRegister()
@@ -147,12 +146,87 @@ func run() error {
 	}
 }
 
+func logACPAvailability(baseURL, apiKey string, logger *observability.Logger) {
+	if logger == nil {
+		return
+	}
+	started := time.Now()
+	probeURL := strings.TrimRight(strings.TrimSpace(baseURL), "/") + "/health"
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, probeURL, nil)
+	if err != nil {
+		logger.LogError(observability.Entry{
+			TraceID:    "startup-acp-check",
+			Component:  "cmd/agent",
+			DurationMS: time.Since(started).Milliseconds(),
+			ErrorType:  "ErrValidation",
+			Error:      err,
+			Fields: map[string]any{
+				"event":   "acp.unavailable",
+				"stage":   "startup_check",
+				"acp_url": probeURL,
+			},
+		})
+		return
+	}
+	req.Header.Set("Authorization", strings.TrimSpace(apiKey))
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		logger.LogError(observability.Entry{
+			TraceID:    "startup-acp-check",
+			Component:  "cmd/agent",
+			DurationMS: time.Since(started).Milliseconds(),
+			ErrorType:  "ErrUpstream",
+			Error:      err,
+			Fields: map[string]any{
+				"event":   "acp.unavailable",
+				"stage":   "startup_check",
+				"acp_url": probeURL,
+			},
+		})
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= http.StatusInternalServerError {
+		logger.LogError(observability.Entry{
+			TraceID:    "startup-acp-check",
+			Component:  "cmd/agent",
+			DurationMS: time.Since(started).Milliseconds(),
+			ErrorType:  "ErrUpstream",
+			Error:      fmt.Errorf("acp health status %d", resp.StatusCode),
+			Fields: map[string]any{
+				"event":   "acp.unavailable",
+				"stage":   "startup_check",
+				"acp_url": probeURL,
+				"status":  resp.StatusCode,
+			},
+		})
+		return
+	}
+
+	logger.LogInfo(observability.Entry{
+		TraceID:    "startup-acp-check",
+		Component:  "cmd/agent",
+		DurationMS: time.Since(started).Milliseconds(),
+		Fields: map[string]any{
+			"event":   "acp.available",
+			"stage":   "startup_check",
+			"acp_url": probeURL,
+			"status":  resp.StatusCode,
+		},
+	})
+}
+
 func buildLLMClient(cfg *config.Config) (llm.LLMClient, error) {
 	switch cfg.LLMProvider {
-	case "anthropic":
-		return llm.NewAnthropicClientFromConfig(cfg)
-	case "openai":
-		return llm.NewOpenAIClientFromConfig(cfg)
+	case "openrouter":
+		return llm.NewOpenRouterClientFromConfig(cfg)
+	case "stub":
+		return llm.NewStubClient(), nil
 	default:
 		return nil, fmt.Errorf("unsupported LLM provider %q", cfg.LLMProvider)
 	}
@@ -168,18 +242,4 @@ func resolvePromptPath() (string, error) {
 		return "", fmt.Errorf("resolve prompt path %s: %w", path, err)
 	}
 	return path, nil
-}
-
-type botTokenStoreBridge struct {
-	store bookably.TokenStore
-}
-
-func (b *botTokenStoreBridge) SaveToken(ctx context.Context, specialistID string, token bot.AuthToken) error {
-	if b == nil || b.store == nil {
-		return errors.New("bot token bridge: store is nil")
-	}
-	return b.store.SaveToken(ctx, specialistID, &bookably.Token{
-		AccessToken:  token.AccessToken,
-		RefreshToken: token.RefreshToken,
-	})
 }

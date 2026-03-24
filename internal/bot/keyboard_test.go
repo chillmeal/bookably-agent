@@ -14,6 +14,7 @@ func TestParseCallbackRoundTrip(t *testing.T) {
 		ConfirmData(planID),
 		CancelData(planID),
 		SlotData(1, planID),
+		BookingData(2, planID),
 	}
 
 	for _, raw := range cases {
@@ -68,5 +69,25 @@ func TestBuildSlotKeyboardAndStripStyles(t *testing.T) {
 				t.Fatalf("expected style to be removed, got %q", btn.Style)
 			}
 		}
+	}
+}
+
+func TestBuildBookingCandidatesKeyboard(t *testing.T) {
+	now := time.Date(2026, 4, 1, 9, 0, 0, 0, time.UTC)
+	keyboard := BuildBookingCandidatesKeyboard("plan2", []domain.Booking{
+		{ID: "b1", ClientName: "Алина", ServiceName: "Массаж", At: now},
+		{ID: "b2", ClientName: "Иван", ServiceName: "Стрижка", At: now.Add(time.Hour)},
+	}, time.UTC)
+
+	if len(keyboard.InlineKeyboard) != 3 {
+		t.Fatalf("expected 3 rows (2 candidates + cancel), got %d", len(keyboard.InlineKeyboard))
+	}
+	first := keyboard.InlineKeyboard[0][0]
+	if first.CallbackData != BookingData(0, "plan2") {
+		t.Fatalf("unexpected booking callback data: %q", first.CallbackData)
+	}
+	last := keyboard.InlineKeyboard[len(keyboard.InlineKeyboard)-1][0]
+	if last.CallbackData != CancelData("plan2") {
+		t.Fatalf("unexpected cancel callback data: %q", last.CallbackData)
 	}
 }

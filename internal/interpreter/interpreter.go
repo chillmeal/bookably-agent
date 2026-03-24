@@ -24,6 +24,13 @@ type ConversationContext struct {
 	History  []Turn
 }
 
+type Progress struct {
+	ChunkCount int
+	Bytes      int64
+	StartedAt  time.Time
+	UpdatedAt  time.Time
+}
+
 type Interpreter struct {
 	llmClient  llm.LLMClient
 	promptPath string
@@ -49,6 +56,10 @@ func New(llmClient llm.LLMClient, promptPath string, timeout time.Duration) (*In
 }
 
 func (i *Interpreter) Interpret(ctx context.Context, userMessage string, convo ConversationContext) (*ActionPlan, error) {
+	return i.InterpretWithProgress(ctx, userMessage, convo, nil)
+}
+
+func (i *Interpreter) InterpretWithProgress(ctx context.Context, userMessage string, convo ConversationContext, onProgress func(Progress)) (*ActionPlan, error) {
 	if i == nil {
 		return nil, fmt.Errorf("interpreter: interpreter is nil")
 	}
@@ -74,6 +85,12 @@ func (i *Interpreter) Interpret(ctx context.Context, userMessage string, convo C
 	if err != nil {
 		return nil, err
 	}
+	if heuristic := heuristicActionPlan(trimmedUserMessage, tz, time.Now().In(tz)); heuristic != nil {
+		heuristic.RawUserMessage = trimmedUserMessage
+		heuristic.Timezone = tz.String()
+		heuristic.RequiresConfirm = heuristic.Intent.RequiresConfirm()
+		return heuristic, nil
+	}
 
 	systemPrompt, err := loadSystemPrompt(i.promptPath, tz)
 	if err != nil {
@@ -84,9 +101,27 @@ func (i *Interpreter) Interpret(ctx context.Context, userMessage string, convo C
 	callCtx, cancel := context.WithTimeout(ctx, i.timeout)
 	defer cancel()
 
-	completion, err := i.llmClient.Complete(callCtx, messages)
-	if err != nil {
-		return nil, fmt.Errorf("interpreter: llm complete: %w", err)
+	var (
+		completion *llm.Completion
+		llmErr     error
+	)
+	if streamingClient, ok := i.llmClient.(llm.StreamingClient); ok {
+		completion, llmErr = streamingClient.CompleteStream(callCtx, messages, func(progress llm.StreamProgress) {
+			if onProgress == nil {
+				return
+			}
+			onProgress(Progress{
+				ChunkCount: progress.ChunkCount,
+				Bytes:      progress.Bytes,
+				StartedAt:  progress.StartedAt,
+				UpdatedAt:  progress.UpdatedAt,
+			})
+		})
+	} else {
+		completion, llmErr = i.llmClient.Complete(callCtx, messages)
+	}
+	if llmErr != nil {
+		return nil, fmt.Errorf("interpreter: llm complete: %w", llmErr)
 	}
 
 	plan, err := ParseActionPlan(completion.Content)
@@ -98,6 +133,32 @@ func (i *Interpreter) Interpret(ctx context.Context, userMessage string, convo C
 	plan.Timezone = tz.String()
 	plan.RequiresConfirm = plan.Intent.RequiresConfirm()
 	return plan, nil
+}
+
+func heuristicActionPlan(message string, tz *time.Location, now time.Time) *ActionPlan {
+	normalized := strings.ToLower(strings.TrimSpace(message))
+	if normalized == "" {
+		return nil
+	}
+
+	if strings.Contains(normalized, "запис") &&
+		(strings.Contains(normalized, "ближай") || strings.Contains(normalized, "что у меня") || strings.Contains(normalized, "какие у меня")) {
+		start := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, tz)
+		end := start.AddDate(0, 0, 6)
+		return &ActionPlan{
+			Intent:          IntentListBookings,
+			Confidence:      0.92,
+			RequiresConfirm: false,
+			Params: ActionParams{
+				DateRange: &DateRange{
+					From: start.Format("2006-01-02"),
+					To:   end.Format("2006-01-02"),
+				},
+				Status: "upcoming",
+			},
+		}
+	}
+	return nil
 }
 
 func loadTimezone(raw string) (*time.Location, error) {

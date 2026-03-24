@@ -1,0 +1,13 @@
+.git
+.gitignore
+*.log
+tmp
+tmp/
+dist
+out
+bin
+coverage.out
+*.test
+docs/ENGINEERING_PLAN.md
+docs/CODEX_WORKFLOW.md
+deploy

@@ -194,3 +194,57 @@ func TestStreamerFinalizeStyleFallbackRetry(t *testing.T) {
 		t.Fatal("expected styles to be stripped on retry")
 	}
 }
+
+func TestStreamerDraftFallbackToEditMessageFlow(t *testing.T) {
+	var (
+		draftCalls int32
+		sendCalls  int32
+		editCalls  int32
+	)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/bottoken/sendMessageDraft":
+			atomic.AddInt32(&draftCalls, 1)
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = io.WriteString(w, `{"ok":false,"description":"Bad Request: RANDOM_ID_INVALID"}`)
+		case "/bottoken/sendMessage":
+			atomic.AddInt32(&sendCalls, 1)
+			_, _ = io.WriteString(w, `{"ok":true,"result":{"message_id":555}}`)
+		case "/bottoken/editMessageText":
+			atomic.AddInt32(&editCalls, 1)
+			_, _ = io.WriteString(w, `{"ok":true,"result":{"message_id":555}}`)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	streamer, err := NewStreamer("token", server.Client(), server.URL)
+	if err != nil {
+		t.Fatalf("NewStreamer: %v", err)
+	}
+
+	if err := streamer.Draft(context.Background(), 1, "Шаг 1"); err != nil {
+		t.Fatalf("Draft #1: %v", err)
+	}
+	if err := streamer.Draft(context.Background(), 1, "Шаг 2"); err != nil {
+		t.Fatalf("Draft #2: %v", err)
+	}
+	msgID, err := streamer.Finalize(context.Background(), 1, "Готово", nil)
+	if err != nil {
+		t.Fatalf("Finalize: %v", err)
+	}
+	if msgID != 555 {
+		t.Fatalf("message id mismatch: %d", msgID)
+	}
+	if atomic.LoadInt32(&draftCalls) != 2 {
+		t.Fatalf("expected 2 draft attempts, got %d", draftCalls)
+	}
+	if atomic.LoadInt32(&sendCalls) != 1 {
+		t.Fatalf("expected single fallback sendMessage, got %d", sendCalls)
+	}
+	if atomic.LoadInt32(&editCalls) < 2 {
+		t.Fatalf("expected editMessageText for progress/finalize, got %d", editCalls)
+	}
+}

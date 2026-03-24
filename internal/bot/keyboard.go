@@ -14,6 +14,7 @@ const (
 	callbackPrefixConfirm = "confirm"
 	callbackPrefixCancel  = "cancel"
 	callbackPrefixSlot    = "slot"
+	callbackPrefixBooking = "booking"
 
 	buttonStyleSuccess = "success"
 	buttonStyleDanger  = "danger"
@@ -25,12 +26,14 @@ const (
 	CallbackTypeConfirm CallbackType = callbackPrefixConfirm
 	CallbackTypeCancel  CallbackType = callbackPrefixCancel
 	CallbackTypeSlot    CallbackType = callbackPrefixSlot
+	CallbackTypeBooking CallbackType = callbackPrefixBooking
 )
 
 type ParsedCallback struct {
-	Type      CallbackType
-	PlanID    string
-	SlotIndex int
+	Type         CallbackType
+	PlanID       string
+	SlotIndex    int
+	BookingIndex int
 }
 
 type WebAppInfo struct {
@@ -59,6 +62,10 @@ func CancelData(planID string) string {
 
 func SlotData(idx int, planID string) string {
 	return fmt.Sprintf("%s:%d:%s", callbackPrefixSlot, idx, strings.TrimSpace(planID))
+}
+
+func BookingData(idx int, planID string) string {
+	return fmt.Sprintf("%s:%d:%s", callbackPrefixBooking, idx, strings.TrimSpace(planID))
 }
 
 func ParseCallback(data string) (*ParsedCallback, error) {
@@ -91,6 +98,19 @@ func ParseCallback(data string) (*ParsedCallback, error) {
 			SlotIndex: idx,
 			PlanID:    strings.TrimSpace(parts[2]),
 		}, nil
+	case callbackPrefixBooking:
+		if len(parts) != 3 || strings.TrimSpace(parts[2]) == "" {
+			return nil, errors.New("bot callback: invalid booking format")
+		}
+		idx, err := strconv.Atoi(strings.TrimSpace(parts[1]))
+		if err != nil || idx < 0 {
+			return nil, errors.New("bot callback: booking index must be non-negative integer")
+		}
+		return &ParsedCallback{
+			Type:         CallbackTypeBooking,
+			BookingIndex: idx,
+			PlanID:       strings.TrimSpace(parts[2]),
+		}, nil
 	default:
 		return nil, fmt.Errorf("bot callback: unknown prefix %q", parts[0])
 	}
@@ -101,14 +121,14 @@ func BuildPreviewKeyboard(planID string) InlineKeyboardMarkup {
 		InlineKeyboard: [][]InlineKeyboardButton{
 			{
 				{
-					Text:         "✅ Применить",
-					CallbackData: ConfirmData(planID),
-					Style:        buttonStyleSuccess,
-				},
-				{
 					Text:         "❌ Отменить",
 					CallbackData: CancelData(planID),
 					Style:        buttonStyleDanger,
+				},
+				{
+					Text:         "✅ Применить",
+					CallbackData: ConfirmData(planID),
+					Style:        buttonStyleSuccess,
 				},
 			},
 		},
@@ -137,6 +157,41 @@ func BuildSlotKeyboard(planID string, slots []domain.Slot, tz *time.Location) In
 	}
 	if len(slotButtons) > 0 {
 		keyboard = append(keyboard, slotButtons)
+	}
+
+	keyboard = append(keyboard, []InlineKeyboardButton{{
+		Text:         "❌ Отменить",
+		CallbackData: CancelData(planID),
+		Style:        buttonStyleDanger,
+	}})
+
+	return InlineKeyboardMarkup{InlineKeyboard: keyboard}
+}
+
+func BuildBookingCandidatesKeyboard(planID string, bookings []domain.Booking, tz *time.Location) InlineKeyboardMarkup {
+	location := tz
+	if location == nil {
+		location = time.UTC
+	}
+
+	max := len(bookings)
+	if max > 3 {
+		max = 3
+	}
+
+	keyboard := make([][]InlineKeyboardButton, 0, max+1)
+	for i := 0; i < max; i++ {
+		booking := bookings[i]
+		label := fmt.Sprintf("%s • %s • %s",
+			compactOrFallback(booking.ClientName, "Клиент"),
+			compactOrFallback(booking.ServiceName, "Услуга"),
+			formatSlotLabel(booking.At, location),
+		)
+		keyboard = append(keyboard, []InlineKeyboardButton{{
+			Text:         label,
+			CallbackData: BookingData(i, planID),
+			Style:        buttonStyleSuccess,
+		}})
 	}
 
 	keyboard = append(keyboard, []InlineKeyboardButton{{
@@ -219,4 +274,16 @@ func formatSlotLabel(ts time.Time, tz *time.Location) string {
 
 func sameDate(a, b time.Time) bool {
 	return a.Year() == b.Year() && a.Month() == b.Month() && a.Day() == b.Day()
+}
+
+func compactOrFallback(value, fallback string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return fallback
+	}
+	if len([]rune(value)) > 22 {
+		rs := []rune(value)
+		return string(rs[:22]) + "…"
+	}
+	return value
 }

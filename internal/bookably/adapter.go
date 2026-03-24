@@ -15,34 +15,30 @@ import (
 )
 
 const (
-	defaultBookingsLimit    = 50
-	defaultSlotsWindow      = 7 * 24 * time.Hour
-	defaultPrefsCacheTTL    = 5 * time.Minute
-	defaultSlotDuration     = time.Hour
-	dayEndDuration          = 24*time.Hour - time.Nanosecond
-	defaultBookingsLookback = 365 * 24 * time.Hour
+	defaultBookingsLimit = 50
+	defaultSlotsWindow   = 7 * 24 * time.Hour
+	defaultPrefsCacheTTL = 5 * time.Minute
+	defaultSlotDuration  = time.Hour
+	dayEndDuration       = 24*time.Hour - time.Nanosecond
+	maxCancelSearchRange = 31 * 24 * time.Hour
 )
 
 var errNoBreakWindows = errors.New("bookably adapter: no breaks provided")
 
 type Adapter struct {
-	client       *Client
-	cache        redis.Cmdable
-	prefsTTL     time.Duration
-	specialistID string
+	client   *Client
+	cache    redis.Cmdable
+	prefsTTL time.Duration
 }
 
-func NewAdapter(client *Client, specialistID string, cache redis.Cmdable, prefsTTL time.Duration) (*Adapter, error) {
+func NewAdapter(client *Client, cache redis.Cmdable, prefsTTL time.Duration) (*Adapter, error) {
 	if client == nil {
 		return nil, errors.New("bookably adapter: client is nil")
-	}
-	if strings.TrimSpace(specialistID) == "" {
-		return nil, errors.New("bookably adapter: specialist id is required")
 	}
 	if prefsTTL <= 0 {
 		prefsTTL = defaultPrefsCacheTTL
 	}
-	return &Adapter{client: client, cache: cache, prefsTTL: prefsTTL, specialistID: specialistID}, nil
+	return &Adapter{client: client, cache: cache, prefsTTL: prefsTTL}, nil
 }
 
 type apiBooking struct {
@@ -240,11 +236,14 @@ func (a *Adapter) GetProviderInfo(ctx context.Context, providerID string) (*doma
 	if err := a.client.GetJSON(ctx, endpointMe, nil, &me); err != nil {
 		return nil, err
 	}
+	if !strings.EqualFold(strings.TrimSpace(me.Actor.Role), "SPECIALIST") {
+		return nil, errors.Join(domain.ErrForbidden, errors.New("bookably adapter: actor is not specialist"))
+	}
 	if strings.TrimSpace(me.Actor.SpecialistID) != "" {
 		resolvedProviderID = me.Actor.SpecialistID
 	}
 	if strings.TrimSpace(resolvedProviderID) == "" {
-		return nil, errors.Join(domain.ErrValidation, errors.New("bookably adapter: specialist id is required"))
+		return nil, errors.Join(domain.ErrForbidden, errors.New("bookably adapter: specialist actor has no specialist id"))
 	}
 
 	services, err := a.listServices(ctx, resolvedProviderID)
@@ -260,7 +259,12 @@ func (a *Adapter) GetProviderInfo(ctx context.Context, providerID string) (*doma
 }
 
 func (a *Adapter) PreviewAvailabilityChange(ctx context.Context, providerID string, p domain.ActionParams) (*domain.Preview, error) {
-	from, to, err := parseDateRangeUTC(p.DateRange)
+	loc, err := a.loadProviderLocation(ctx, providerID)
+	if err != nil {
+		return nil, err
+	}
+
+	from, to, err := parseDateRangeInLocation(p.DateRange, loc)
 	if err != nil {
 		return nil, err
 	}
@@ -288,7 +292,7 @@ func (a *Adapter) PreviewAvailabilityChange(ctx context.Context, providerID stri
 
 	switch {
 	case p.WorkingHours != nil:
-		targetSlots, targetErr := buildWorkingHoursSlots(from, to, p, inferSlotDuration(slots))
+		targetSlots, targetErr := buildWorkingHoursSlots(from, to, p, inferSlotDuration(slots), loc)
 		if targetErr != nil {
 			return nil, targetErr
 		}
@@ -319,7 +323,7 @@ func (a *Adapter) PreviewAvailabilityChange(ctx context.Context, providerID stri
 		}
 
 	case p.BreakSlot != nil || len(p.Breaks) > 0:
-		windows, buildErr := buildBreakWindows(from, to, p)
+		windows, buildErr := buildBreakWindows(from, to, p, loc)
 		if buildErr != nil {
 			return nil, buildErr
 		}
@@ -334,7 +338,7 @@ func (a *Adapter) PreviewAvailabilityChange(ctx context.Context, providerID stri
 		}
 
 	default:
-		windows, buildErr := buildCloseWindows(from, to, p.TimeRange)
+		windows, buildErr := buildCloseWindows(from, to, p.TimeRange, loc)
 		if buildErr != nil {
 			return nil, buildErr
 		}
@@ -354,11 +358,16 @@ func (a *Adapter) PreviewAvailabilityChange(ctx context.Context, providerID stri
 
 	sort.Slice(createSlots, func(i, j int) bool { return createSlots[i].Start.Before(createSlots[j].Start) })
 	sort.Strings(deleteSlotIDs)
+	availabilityRanges, availabilityErr := buildAvailabilityExecutionRanges(from, to, p, slots, bookings, loc)
+	if availabilityErr != nil {
+		return nil, availabilityErr
+	}
 	var availabilityExec *domain.AvailabilityExecutionPayload
-	if len(createSlots) > 0 || len(deleteSlotIDs) > 0 {
+	if len(createSlots) > 0 || len(deleteSlotIDs) > 0 || len(availabilityRanges) > 0 {
 		availabilityExec = &domain.AvailabilityExecutionPayload{
 			CreateSlots:   createSlots,
 			DeleteSlotIDs: deleteSlotIDs,
+			Availability:  availabilityRanges,
 		}
 	}
 
@@ -414,8 +423,18 @@ func (a *Adapter) PreviewBookingCreate(ctx context.Context, providerID string, p
 }
 
 func (a *Adapter) PreviewBookingCancel(ctx context.Context, providerID string, p domain.ActionParams) (*domain.Preview, error) {
+	loc, err := a.loadProviderLocation(ctx, providerID)
+	if err != nil {
+		return nil, err
+	}
+
+	filter, exactTimeRef, hasExactTime, err := buildCancelFilter(p, time.Now().UTC(), loc)
+	if err != nil {
+		return nil, err
+	}
+
 	if strings.TrimSpace(p.BookingID) != "" {
-		bookings, err := a.GetBookings(ctx, providerID, domain.BookingFilter{Limit: defaultBookingsLimit})
+		bookings, err := a.GetBookings(ctx, providerID, filter)
 		if err != nil {
 			return nil, err
 		}
@@ -427,29 +446,40 @@ func (a *Adapter) PreviewBookingCancel(ctx context.Context, providerID string, p
 		return nil, errors.Join(domain.ErrNotFound, fmt.Errorf("bookably adapter: booking %s not found", p.BookingID))
 	}
 
-	name := strings.ToLower(strings.TrimSpace(p.ClientName))
-	if name == "" {
-		return nil, errors.Join(domain.ErrValidation, errors.New("bookably adapter: client_name is required"))
-	}
-
-	now := time.Now().UTC()
-	lookback := now.Add(-defaultBookingsLookback)
-	future := now.Add(defaultBookingsLookback)
-	bookings, err := a.GetBookings(ctx, providerID, domain.BookingFilter{
-		From:  &lookback,
-		To:    &future,
-		Limit: defaultBookingsLimit,
-	})
+	bookings, err := a.GetBookings(ctx, providerID, filter)
 	if err != nil && !errors.Is(err, domain.ErrNotFound) {
 		return nil, err
 	}
 
+	nameNeedle := strings.ToLower(strings.TrimSpace(p.ClientName))
 	matches := make([]domain.Booking, 0)
 	for _, b := range bookings {
-		if strings.Contains(strings.ToLower(strings.TrimSpace(b.ClientName)), name) {
-			matches = append(matches, b)
+		if nameNeedle != "" && !strings.Contains(strings.ToLower(strings.TrimSpace(b.ClientName)), nameNeedle) {
+			continue
 		}
+		if hasExactTime && !cancelTimeMatches(b.At, exactTimeRef, true) {
+			continue
+		}
+		matches = append(matches, b)
 	}
+
+	if !hasExactTime && strings.TrimSpace(p.ApproximateTime) != "" {
+		approx, hasClock, parseErr := parseCancelApproximateTime(strings.TrimSpace(p.ApproximateTime), loc)
+		if parseErr != nil {
+			return nil, parseErr
+		}
+		filtered := make([]domain.Booking, 0, len(matches))
+		for _, b := range matches {
+			if cancelTimeMatches(b.At, approx, hasClock) {
+				filtered = append(filtered, b)
+			}
+		}
+		matches = filtered
+	}
+
+	sort.Slice(matches, func(i, j int) bool {
+		return matches[i].At.Before(matches[j].At)
+	})
 
 	switch len(matches) {
 	case 0:
@@ -462,15 +492,19 @@ func (a *Adapter) PreviewBookingCancel(ctx context.Context, providerID string, p
 			RiskLevel:     domain.RiskHigh,
 		}, nil
 	default:
-		return nil, errors.Join(domain.ErrConflict, fmt.Errorf("bookably adapter: multiple bookings found for client %q", p.ClientName))
+		if len(matches) > 3 {
+			matches = matches[:3]
+		}
+		return &domain.Preview{
+			Summary:           "Multiple bookings matched for cancellation",
+			BookingCandidates: matches,
+			RiskLevel:         domain.RiskHigh,
+		}, nil
 	}
 }
 
 func (a *Adapter) resolveProviderID(providerID string) string {
-	if strings.TrimSpace(providerID) != "" {
-		return strings.TrimSpace(providerID)
-	}
-	return a.specialistID
+	return strings.TrimSpace(providerID)
 }
 
 func (a *Adapter) listServices(ctx context.Context, providerID string) ([]domain.Service, error) {
@@ -610,6 +644,22 @@ func (a *Adapter) fetchSpecialistTimezone(ctx context.Context, specialistID stri
 	return timezone, nil
 }
 
+func (a *Adapter) loadProviderLocation(ctx context.Context, providerID string) (*time.Location, error) {
+	resolved := a.resolveProviderID(providerID)
+	if strings.TrimSpace(resolved) == "" {
+		return nil, errors.Join(domain.ErrValidation, errors.New("bookably adapter: provider_id is required"))
+	}
+	timezone, err := a.fetchSpecialistTimezone(ctx, resolved)
+	if err != nil {
+		return nil, err
+	}
+	loc, err := time.LoadLocation(strings.TrimSpace(timezone))
+	if err != nil {
+		return nil, errors.Join(domain.ErrValidation, fmt.Errorf("bookably adapter: invalid timezone %q", timezone))
+	}
+	return loc, nil
+}
+
 func mapBookings(in []apiBooking) ([]domain.Booking, error) {
 	out := make([]domain.Booking, 0, len(in))
 	for _, item := range in {
@@ -702,15 +752,18 @@ func inferSlotDuration(slots []domain.Slot) time.Duration {
 	return best
 }
 
-func parseDateRangeUTC(r *domain.DateRange) (time.Time, time.Time, error) {
+func parseDateRangeInLocation(r *domain.DateRange, loc *time.Location) (time.Time, time.Time, error) {
+	if loc == nil {
+		loc = time.UTC
+	}
 	if r == nil || strings.TrimSpace(r.From) == "" || strings.TrimSpace(r.To) == "" {
 		return time.Time{}, time.Time{}, errors.Join(domain.ErrValidation, errors.New("bookably adapter: date_range.from and date_range.to are required"))
 	}
-	from, err := time.ParseInLocation("2006-01-02", r.From, time.UTC)
+	from, err := time.ParseInLocation("2006-01-02", r.From, loc)
 	if err != nil {
 		return time.Time{}, time.Time{}, errors.Join(domain.ErrValidation, fmt.Errorf("bookably adapter: invalid date_range.from: %w", err))
 	}
-	to, err := time.ParseInLocation("2006-01-02", r.To, time.UTC)
+	to, err := time.ParseInLocation("2006-01-02", r.To, loc)
 	if err != nil {
 		return time.Time{}, time.Time{}, errors.Join(domain.ErrValidation, fmt.Errorf("bookably adapter: invalid date_range.to: %w", err))
 	}
@@ -729,14 +782,17 @@ func parseClock(clock string) (int, int, error) {
 }
 
 func dateAt(t time.Time, h, m int) time.Time {
-	return time.Date(t.Year(), t.Month(), t.Day(), h, m, 0, 0, time.UTC)
+	return time.Date(t.Year(), t.Month(), t.Day(), h, m, 0, 0, t.Location())
 }
 
-func buildCloseWindows(from, to time.Time, tr *domain.TimeRange) ([]timeWindow, error) {
+func buildCloseWindows(from, to time.Time, tr *domain.TimeRange, loc *time.Location) ([]timeWindow, error) {
+	if loc == nil {
+		loc = time.UTC
+	}
 	windows := make([]timeWindow, 0)
-	for day := dateAt(from, 0, 0); !day.After(to); day = day.AddDate(0, 0, 1) {
+	for day := time.Date(from.In(loc).Year(), from.In(loc).Month(), from.In(loc).Day(), 0, 0, 0, 0, loc); !day.After(to.In(loc)); day = day.AddDate(0, 0, 1) {
 		if tr == nil || (strings.TrimSpace(tr.From) == "" && strings.TrimSpace(tr.To) == "") {
-			windows = append(windows, timeWindow{From: day, To: day.Add(24 * time.Hour)})
+			windows = append(windows, timeWindow{From: day.UTC(), To: day.Add(24 * time.Hour).UTC()})
 			continue
 		}
 		fromH, fromM, err := parseClock(tr.From)
@@ -752,12 +808,15 @@ func buildCloseWindows(from, to time.Time, tr *domain.TimeRange) ([]timeWindow, 
 		if !end.After(start) {
 			return nil, errors.Join(domain.ErrValidation, errors.New("bookably adapter: close time_range.to must be after from"))
 		}
-		windows = append(windows, timeWindow{From: start, To: end})
+		windows = append(windows, timeWindow{From: start.UTC(), To: end.UTC()})
 	}
 	return windows, nil
 }
 
-func buildBreakWindows(from, to time.Time, p domain.ActionParams) ([]timeWindow, error) {
+func buildBreakWindows(from, to time.Time, p domain.ActionParams, loc *time.Location) ([]timeWindow, error) {
+	if loc == nil {
+		loc = time.UTC
+	}
 	breaks := make([]domain.TimeRange, 0)
 	if p.BreakSlot != nil {
 		breaks = append(breaks, *p.BreakSlot)
@@ -769,7 +828,7 @@ func buildBreakWindows(from, to time.Time, p domain.ActionParams) ([]timeWindow,
 
 	weekdaySet := normalizeWeekdaySet(p.Weekdays)
 	windows := make([]timeWindow, 0)
-	for day := dateAt(from, 0, 0); !day.After(to); day = day.AddDate(0, 0, 1) {
+	for day := time.Date(from.In(loc).Year(), from.In(loc).Month(), from.In(loc).Day(), 0, 0, 0, 0, loc); !day.After(to.In(loc)); day = day.AddDate(0, 0, 1) {
 		if len(weekdaySet) > 0 {
 			if _, ok := weekdaySet[strings.ToLower(day.Weekday().String()[:3])]; !ok {
 				continue
@@ -789,13 +848,16 @@ func buildBreakWindows(from, to time.Time, p domain.ActionParams) ([]timeWindow,
 			if !end.After(start) {
 				return nil, errors.Join(domain.ErrValidation, errors.New("bookably adapter: break.to must be after break.from"))
 			}
-			windows = append(windows, timeWindow{From: start, To: end})
+			windows = append(windows, timeWindow{From: start.UTC(), To: end.UTC()})
 		}
 	}
 	return windows, nil
 }
 
-func buildWorkingHoursSlots(from, to time.Time, p domain.ActionParams, slotDuration time.Duration) ([]domain.Slot, error) {
+func buildWorkingHoursSlots(from, to time.Time, p domain.ActionParams, slotDuration time.Duration, loc *time.Location) ([]domain.Slot, error) {
+	if loc == nil {
+		loc = time.UTC
+	}
 	if p.WorkingHours == nil {
 		return nil, errors.Join(domain.ErrValidation, errors.New("bookably adapter: working_hours are required"))
 	}
@@ -809,13 +871,13 @@ func buildWorkingHoursSlots(from, to time.Time, p domain.ActionParams, slotDurat
 	}
 
 	weekdaySet := normalizeWeekdaySet(p.Weekdays)
-	breakWindows, err := buildBreakWindows(from, to, domain.ActionParams{Breaks: p.Breaks, BreakSlot: p.BreakSlot, Weekdays: p.Weekdays})
+	breakWindows, err := buildBreakWindows(from, to, domain.ActionParams{Breaks: p.Breaks, BreakSlot: p.BreakSlot, Weekdays: p.Weekdays}, loc)
 	if err != nil && !errors.Is(err, errNoBreakWindows) {
 		return nil, err
 	}
 
 	slots := make([]domain.Slot, 0)
-	for day := dateAt(from, 0, 0); !day.After(to); day = day.AddDate(0, 0, 1) {
+	for day := time.Date(from.In(loc).Year(), from.In(loc).Month(), from.In(loc).Day(), 0, 0, 0, 0, loc); !day.After(to.In(loc)); day = day.AddDate(0, 0, 1) {
 		if len(weekdaySet) > 0 {
 			if _, ok := weekdaySet[strings.ToLower(day.Weekday().String()[:3])]; !ok {
 				continue
@@ -829,7 +891,7 @@ func buildWorkingHoursSlots(from, to time.Time, p domain.ActionParams, slotDurat
 		}
 
 		for _, bw := range breakWindows {
-			if sameDayUTC(day, bw.From) && (bw.From.Before(workStart) || bw.To.After(workEnd)) {
+			if sameDayInLocation(day, bw.From, loc) && (bw.From.Before(workStart.UTC()) || bw.To.After(workEnd.UTC())) {
 				return nil, errors.Join(domain.ErrValidation, errors.New("bookably adapter: break must be within working hours"))
 			}
 		}
@@ -860,8 +922,292 @@ func normalizeWeekdaySet(in []string) map[string]struct{} {
 	return set
 }
 
-func sameDayUTC(day time.Time, value time.Time) bool {
-	return day.Year() == value.Year() && day.Month() == value.Month() && day.Day() == value.Day()
+func sameDayInLocation(day time.Time, value time.Time, loc *time.Location) bool {
+	if loc == nil {
+		loc = time.UTC
+	}
+	d := day.In(loc)
+	v := value.In(loc)
+	return d.Year() == v.Year() && d.Month() == v.Month() && d.Day() == v.Day()
+}
+
+type minuteRange struct {
+	start int
+	end   int
+}
+
+func buildAvailabilityExecutionRanges(
+	from time.Time,
+	to time.Time,
+	p domain.ActionParams,
+	slots []domain.Slot,
+	bookings []domain.Booking,
+	loc *time.Location,
+) ([]domain.AvailabilityDay, error) {
+	if loc == nil {
+		loc = time.UTC
+	}
+
+	selectedDays := selectedDateKeys(from, to, p.Weekdays, loc)
+	if len(selectedDays) == 0 {
+		return nil, nil
+	}
+
+	switch {
+	case p.WorkingHours != nil:
+		return buildWorkingHoursAvailabilityDays(selectedDays, p, loc)
+	case p.BreakSlot != nil || len(p.Breaks) > 0:
+		return buildAdjustedAvailabilityDays(selectedDays, p, slots, bookings, loc, false)
+	default:
+		return buildAdjustedAvailabilityDays(selectedDays, p, slots, bookings, loc, true)
+	}
+}
+
+func selectedDateKeys(from, to time.Time, weekdays []string, loc *time.Location) []time.Time {
+	if loc == nil {
+		loc = time.UTC
+	}
+	start := time.Date(from.In(loc).Year(), from.In(loc).Month(), from.In(loc).Day(), 0, 0, 0, 0, loc)
+	end := time.Date(to.In(loc).Year(), to.In(loc).Month(), to.In(loc).Day(), 0, 0, 0, 0, loc)
+	set := normalizeWeekdaySet(weekdays)
+	out := make([]time.Time, 0)
+	for day := start; !day.After(end); day = day.AddDate(0, 0, 1) {
+		if len(set) > 0 {
+			wd := strings.ToLower(day.Weekday().String()[:3])
+			if _, ok := set[wd]; !ok {
+				continue
+			}
+		}
+		out = append(out, day)
+	}
+	return out
+}
+
+func buildWorkingHoursAvailabilityDays(days []time.Time, p domain.ActionParams, loc *time.Location) ([]domain.AvailabilityDay, error) {
+	startH, startM, err := parseClock(p.WorkingHours.From)
+	if err != nil {
+		return nil, err
+	}
+	endH, endM, err := parseClock(p.WorkingHours.To)
+	if err != nil {
+		return nil, err
+	}
+	workStart := startH*60 + startM
+	workEnd := endH*60 + endM
+	if workEnd <= workStart {
+		return nil, errors.Join(domain.ErrValidation, errors.New("bookably adapter: working_hours.to must be after from"))
+	}
+
+	breakRanges, err := parseBreakMinuteRanges(p)
+	if err != nil {
+		return nil, err
+	}
+	for _, br := range breakRanges {
+		if br.start < workStart || br.end > workEnd {
+			return nil, errors.Join(domain.ErrValidation, errors.New("bookably adapter: break must be within working hours"))
+		}
+	}
+
+	base := []minuteRange{{start: workStart, end: workEnd}}
+	ranges := subtractMinuteRanges(base, breakRanges)
+
+	out := make([]domain.AvailabilityDay, 0, len(days))
+	for _, day := range days {
+		out = append(out, domain.AvailabilityDay{
+			Date:   day.In(loc).Format("2006-01-02"),
+			Ranges: toAvailabilityRanges(ranges),
+		})
+	}
+	return out, nil
+}
+
+func buildAdjustedAvailabilityDays(
+	days []time.Time,
+	p domain.ActionParams,
+	slots []domain.Slot,
+	bookings []domain.Booking,
+	loc *time.Location,
+	isClose bool,
+) ([]domain.AvailabilityDay, error) {
+	baseline := buildBaselineRangesByDate(slots, bookings, loc)
+	out := make([]domain.AvailabilityDay, 0, len(days))
+
+	var cut []minuteRange
+	if isClose {
+		if p.TimeRange == nil || (strings.TrimSpace(p.TimeRange.From) == "" && strings.TrimSpace(p.TimeRange.To) == "") {
+			cut = []minuteRange{{start: 0, end: 24 * 60}}
+		} else {
+			fromH, fromM, err := parseClock(p.TimeRange.From)
+			if err != nil {
+				return nil, err
+			}
+			toH, toM, err := parseClock(p.TimeRange.To)
+			if err != nil {
+				return nil, err
+			}
+			start := fromH*60 + fromM
+			end := toH*60 + toM
+			if end <= start {
+				return nil, errors.Join(domain.ErrValidation, errors.New("bookably adapter: close time_range.to must be after from"))
+			}
+			cut = []minuteRange{{start: start, end: end}}
+		}
+	} else {
+		var err error
+		cut, err = parseBreakMinuteRanges(p)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	for _, day := range days {
+		key := day.In(loc).Format("2006-01-02")
+		base := baseline[key]
+		updated := subtractMinuteRanges(base, cut)
+		out = append(out, domain.AvailabilityDay{
+			Date:   key,
+			Ranges: toAvailabilityRanges(updated),
+		})
+	}
+
+	return out, nil
+}
+
+func parseBreakMinuteRanges(p domain.ActionParams) ([]minuteRange, error) {
+	rawBreaks := make([]domain.TimeRange, 0)
+	if p.BreakSlot != nil {
+		rawBreaks = append(rawBreaks, *p.BreakSlot)
+	}
+	rawBreaks = append(rawBreaks, p.Breaks...)
+
+	out := make([]minuteRange, 0, len(rawBreaks))
+	for _, br := range rawBreaks {
+		fromH, fromM, err := parseClock(br.From)
+		if err != nil {
+			return nil, err
+		}
+		toH, toM, err := parseClock(br.To)
+		if err != nil {
+			return nil, err
+		}
+		start := fromH*60 + fromM
+		end := toH*60 + toM
+		if end <= start {
+			return nil, errors.Join(domain.ErrValidation, errors.New("bookably adapter: break.to must be after break.from"))
+		}
+		out = append(out, minuteRange{start: start, end: end})
+	}
+	return mergeMinuteRanges(out), nil
+}
+
+func buildBaselineRangesByDate(slots []domain.Slot, bookings []domain.Booking, loc *time.Location) map[string][]minuteRange {
+	if loc == nil {
+		loc = time.UTC
+	}
+	out := make(map[string][]minuteRange)
+	appendInterval := func(start, end time.Time) {
+		localStart := start.In(loc)
+		localEnd := end.In(loc)
+		if localEnd.Before(localStart) || localEnd.Equal(localStart) {
+			return
+		}
+		if localStart.Year() != localEnd.Year() || localStart.YearDay() != localEnd.YearDay() {
+			return
+		}
+		key := localStart.Format("2006-01-02")
+		startMin := localStart.Hour()*60 + localStart.Minute()
+		endMin := localEnd.Hour()*60 + localEnd.Minute()
+		if endMin <= startMin {
+			return
+		}
+		out[key] = append(out[key], minuteRange{start: startMin, end: endMin})
+	}
+
+	for _, slot := range slots {
+		appendInterval(slot.Start, slot.End)
+	}
+	for _, booking := range bookings {
+		end := booking.At.Add(time.Duration(booking.DurationMin) * time.Minute)
+		appendInterval(booking.At, end)
+	}
+
+	for key, ranges := range out {
+		out[key] = mergeMinuteRanges(ranges)
+	}
+	return out
+}
+
+func mergeMinuteRanges(input []minuteRange) []minuteRange {
+	if len(input) == 0 {
+		return nil
+	}
+	ranges := make([]minuteRange, 0, len(input))
+	for _, r := range input {
+		if r.end <= r.start {
+			continue
+		}
+		ranges = append(ranges, r)
+	}
+	if len(ranges) == 0 {
+		return nil
+	}
+	sort.Slice(ranges, func(i, j int) bool {
+		if ranges[i].start == ranges[j].start {
+			return ranges[i].end < ranges[j].end
+		}
+		return ranges[i].start < ranges[j].start
+	})
+
+	merged := make([]minuteRange, 0, len(ranges))
+	current := ranges[0]
+	for i := 1; i < len(ranges); i++ {
+		r := ranges[i]
+		if r.start <= current.end {
+			if r.end > current.end {
+				current.end = r.end
+			}
+			continue
+		}
+		merged = append(merged, current)
+		current = r
+	}
+	merged = append(merged, current)
+	return merged
+}
+
+func subtractMinuteRanges(base []minuteRange, cuts []minuteRange) []minuteRange {
+	result := mergeMinuteRanges(base)
+	for _, cut := range mergeMinuteRanges(cuts) {
+		next := make([]minuteRange, 0, len(result))
+		for _, r := range result {
+			if cut.end <= r.start || cut.start >= r.end {
+				next = append(next, r)
+				continue
+			}
+			if cut.start > r.start {
+				next = append(next, minuteRange{start: r.start, end: cut.start})
+			}
+			if cut.end < r.end {
+				next = append(next, minuteRange{start: cut.end, end: r.end})
+			}
+		}
+		result = next
+	}
+	return mergeMinuteRanges(result)
+}
+
+func toAvailabilityRanges(ranges []minuteRange) []domain.AvailabilityRange {
+	if len(ranges) == 0 {
+		return []domain.AvailabilityRange{}
+	}
+	out := make([]domain.AvailabilityRange, 0, len(ranges))
+	for _, r := range mergeMinuteRanges(ranges) {
+		out = append(out, domain.AvailabilityRange{
+			StartTime: fmt.Sprintf("%02d:%02d", r.start/60, r.start%60),
+			EndTime:   fmt.Sprintf("%02d:%02d", r.end/60, r.end%60),
+		})
+	}
+	return out
 }
 
 func findConflicts(bookings []domain.Booking, removed []timeWindow) []domain.Conflict {
@@ -911,4 +1257,131 @@ func parseOptionalDateTimeUTC(candidates ...string) (time.Time, error) {
 		return time.Time{}, errors.Join(domain.ErrValidation, fmt.Errorf("bookably adapter: invalid datetime %q", value))
 	}
 	return time.Now().UTC(), nil
+}
+
+func buildCancelFilter(p domain.ActionParams, now time.Time, loc *time.Location) (domain.BookingFilter, time.Time, bool, error) {
+	if loc == nil {
+		loc = time.UTC
+	}
+	filter := domain.BookingFilter{
+		Status:    "upcoming",
+		Direction: "future",
+		Limit:     defaultBookingsLimit,
+	}
+
+	if strings.TrimSpace(p.ApproximateTime) != "" {
+		approx, _, err := parseCancelApproximateTime(strings.TrimSpace(p.ApproximateTime), loc)
+		if err != nil {
+			return domain.BookingFilter{}, time.Time{}, false, err
+		}
+		from, to := dayBoundsInLocation(approx, loc)
+		filter.From = &from
+		filter.To = &to
+		return clampCancelFilterRange(filter), approx, true, nil
+	}
+
+	if p.DateRange != nil && strings.TrimSpace(p.DateRange.From) != "" {
+		from, to, err := parseCancelDateRangeInLocation(p.DateRange, loc)
+		if err != nil {
+			return domain.BookingFilter{}, time.Time{}, false, err
+		}
+		filter.From = &from
+		filter.To = &to
+		return clampCancelFilterRange(filter), time.Time{}, false, nil
+	}
+
+	from := now.UTC()
+	to := from.Add(maxCancelSearchRange)
+	filter.From = &from
+	filter.To = &to
+	return filter, time.Time{}, false, nil
+}
+
+func parseCancelApproximateTime(raw string, loc *time.Location) (time.Time, bool, error) {
+	if loc == nil {
+		loc = time.UTC
+	}
+	value := strings.TrimSpace(raw)
+	layoutsWithClock := []string{
+		time.RFC3339,
+		"2006-01-02T15:04:05",
+		"2006-01-02T15:04",
+	}
+	for _, layout := range layoutsWithClock {
+		if layout == time.RFC3339 {
+			if parsed, err := time.Parse(layout, value); err == nil {
+				return parsed.UTC(), true, nil
+			}
+			continue
+		}
+		if parsed, err := time.ParseInLocation(layout, value, loc); err == nil {
+			return parsed.UTC(), true, nil
+		}
+	}
+	if parsed, err := time.ParseInLocation("2006-01-02", value, loc); err == nil {
+		return parsed.UTC(), false, nil
+	}
+	return time.Time{}, false, errors.Join(domain.ErrValidation, fmt.Errorf("bookably adapter: invalid approximate_time %q", raw))
+}
+
+func parseCancelDateRangeInLocation(r *domain.DateRange, loc *time.Location) (time.Time, time.Time, error) {
+	if loc == nil {
+		loc = time.UTC
+	}
+	from, err := time.ParseInLocation("2006-01-02", strings.TrimSpace(r.From), loc)
+	if err != nil {
+		return time.Time{}, time.Time{}, errors.Join(domain.ErrValidation, fmt.Errorf("bookably adapter: invalid cancel date_range.from: %w", err))
+	}
+	toRaw := strings.TrimSpace(r.To)
+	if toRaw == "" {
+		dayFrom, dayTo := dayBoundsInLocation(from, loc)
+		return dayFrom, dayTo, nil
+	}
+	to, err := time.ParseInLocation("2006-01-02", toRaw, loc)
+	if err != nil {
+		return time.Time{}, time.Time{}, errors.Join(domain.ErrValidation, fmt.Errorf("bookably adapter: invalid cancel date_range.to: %w", err))
+	}
+	fromUTC := time.Date(from.Year(), from.Month(), from.Day(), 0, 0, 0, 0, loc).UTC()
+	toUTC := time.Date(to.Year(), to.Month(), to.Day(), 23, 59, 59, int(time.Second-time.Nanosecond), loc).UTC()
+	if toUTC.Before(fromUTC) {
+		return time.Time{}, time.Time{}, errors.Join(domain.ErrValidation, errors.New("bookably adapter: cancel date range is inverted"))
+	}
+	return fromUTC, toUTC, nil
+}
+
+func dayBoundsInLocation(t time.Time, loc *time.Location) (time.Time, time.Time) {
+	if loc == nil {
+		loc = time.UTC
+	}
+	local := t.In(loc)
+	day := time.Date(local.Year(), local.Month(), local.Day(), 0, 0, 0, 0, loc)
+	return day.UTC(), day.Add(dayEndDuration).UTC()
+}
+
+func clampCancelFilterRange(filter domain.BookingFilter) domain.BookingFilter {
+	if filter.From == nil || filter.To == nil {
+		return filter
+	}
+	from := filter.From.UTC()
+	to := filter.To.UTC()
+	maxTo := from.Add(maxCancelSearchRange)
+	if to.After(maxTo) {
+		to = maxTo
+	}
+	filter.From = &from
+	filter.To = &to
+	return filter
+}
+
+func cancelTimeMatches(bookingAt time.Time, reference time.Time, hasClock bool) bool {
+	b := bookingAt.UTC()
+	r := reference.UTC()
+	if hasClock {
+		diff := b.Sub(r)
+		if diff < 0 {
+			diff = -diff
+		}
+		return diff <= 6*time.Hour
+	}
+	return b.Year() == r.Year() && b.Month() == r.Month() && b.Day() == r.Day()
 }

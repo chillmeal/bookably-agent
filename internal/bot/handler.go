@@ -11,10 +11,12 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/chillmeal/bookably-agent/internal/actorctx"
 	"github.com/chillmeal/bookably-agent/internal/domain"
 	"github.com/chillmeal/bookably-agent/internal/interpreter"
 	"github.com/chillmeal/bookably-agent/internal/session"
@@ -27,14 +29,17 @@ var (
 	ErrExecutionPolicyViolation = errors.New("bot handler: execution policy violation")
 	ErrExecutionTransient       = errors.New("bot handler: execution transient")
 	ErrExecutionContractBlocked = errors.New("bot handler: execution contract blocked")
+	reCancelClock               = regexp.MustCompile(`\b([01]?\d|2[0-3])[:. ]([0-5]\d)\b`)
+	reCancelNumericDate         = regexp.MustCompile(`\b(\d{1,2})[./](\d{1,2})(?:[./](\d{2,4}))?\b`)
+	reCancelTextDate            = regexp.MustCompile(`\b(\d{1,2})\s+(январ[ья]|феврал[ья]|март[а]?|апрел[ья]|ма[йя]|июн[ья]|июл[ья]|август[а]?|сентябр[ья]|октябр[ья]|ноябр[ья]|декабр[ья])\b`)
 )
 
 type HandlerConfig struct {
-	WebhookSecret     string
-	WebhookURL        string
-	MiniAppURL        string
-	DefaultProviderID string
-	PlanTTL           time.Duration
+	WebhookSecret string
+	WebhookURL    string
+	MiniAppURL    string
+	PlanTTL       time.Duration
+	WorkerTimeout time.Duration
 }
 
 type TelegramGateway interface {
@@ -51,6 +56,10 @@ type InterpreterService interface {
 	Interpret(ctx context.Context, userMessage string, convo interpreter.ConversationContext) (*interpreter.ActionPlan, error)
 }
 
+type interpreterWithProgress interface {
+	InterpretWithProgress(ctx context.Context, userMessage string, convo interpreter.ConversationContext, onProgress func(interpreter.Progress)) (*interpreter.ActionPlan, error)
+}
+
 type ExecutionResult struct {
 	Message string
 }
@@ -59,53 +68,39 @@ type ACPExecutor interface {
 	ExecuteConfirmed(ctx context.Context, s *session.Session, pending *session.PendingPlan) (*ExecutionResult, error)
 }
 
-type AuthToken struct {
-	AccessToken  string
-	RefreshToken string
-}
-
-type SpecialistTokenStore interface {
-	SaveToken(ctx context.Context, specialistID string, token AuthToken) error
-}
-
 type Handler struct {
 	store       session.SessionStore
 	interpreter InterpreterService
 	provider    domain.Provider
 	executor    ACPExecutor
-	tokenStore  SpecialistTokenStore
 	telegram    TelegramGateway
 	logger      *observability.Logger
 
-	webhookSecret     string
-	webhookURL        string
-	miniAppURL        string
-	defaultProviderID string
-	planTTL           time.Duration
+	webhookSecret string
+	webhookURL    string
+	miniAppURL    string
+	planTTL       time.Duration
+	workerTimeout time.Duration
 
 	clock func() time.Time
 
 	locksMu   sync.Mutex
 	chatLocks map[int64]*sync.Mutex
+	processWG sync.WaitGroup
 }
 
 type webhookUpdate struct {
+	UpdateID      int64                        `json:"update_id,omitempty"`
 	Message       *telegramMessageUpdate       `json:"message,omitempty"`
 	CallbackQuery *telegramCallbackQueryUpdate `json:"callback_query,omitempty"`
 }
 
 type telegramMessageUpdate struct {
-	MessageID  int64               `json:"message_id"`
-	Chat       telegramChat        `json:"chat"`
-	From       telegramFrom        `json:"from"`
-	Text       string              `json:"text"`
-	Date       int64               `json:"date"`
-	WebAppData *telegramWebAppData `json:"web_app_data,omitempty"`
-}
-
-type telegramWebAppData struct {
-	Data       string `json:"data"`
-	ButtonText string `json:"button_text"`
+	MessageID int64        `json:"message_id"`
+	Chat      telegramChat `json:"chat"`
+	From      telegramFrom `json:"from"`
+	Text      string       `json:"text"`
+	Date      int64        `json:"date"`
 }
 
 type telegramCallbackQueryUpdate struct {
@@ -128,7 +123,7 @@ type telegramFrom struct {
 	ID int64 `json:"id"`
 }
 
-func NewHandler(cfg HandlerConfig, store session.SessionStore, interp InterpreterService, provider domain.Provider, executor ACPExecutor, tokenStore SpecialistTokenStore, tg TelegramGateway) (*Handler, error) {
+func NewHandler(cfg HandlerConfig, store session.SessionStore, interp InterpreterService, provider domain.Provider, executor ACPExecutor, tg TelegramGateway) (*Handler, error) {
 	if store == nil {
 		return nil, errors.New("bot handler: session store is nil")
 	}
@@ -144,37 +139,33 @@ func NewHandler(cfg HandlerConfig, store session.SessionStore, interp Interprete
 	if tg == nil {
 		return nil, errors.New("bot handler: telegram gateway is nil")
 	}
-	if tokenStore == nil {
-		return nil, errors.New("bot handler: token store is nil")
-	}
 	if strings.TrimSpace(cfg.WebhookSecret) == "" {
 		return nil, errors.New("bot handler: webhook secret is required")
 	}
 	if strings.TrimSpace(cfg.MiniAppURL) == "" {
 		return nil, errors.New("bot handler: mini app URL is required")
 	}
-	if strings.TrimSpace(cfg.DefaultProviderID) == "" {
-		return nil, errors.New("bot handler: default provider id is required")
-	}
 	if cfg.PlanTTL <= 0 {
 		cfg.PlanTTL = 15 * time.Minute
 	}
+	if cfg.WorkerTimeout <= 0 {
+		cfg.WorkerTimeout = 90 * time.Second
+	}
 
 	return &Handler{
-		store:             store,
-		interpreter:       interp,
-		provider:          provider,
-		executor:          executor,
-		tokenStore:        tokenStore,
-		telegram:          tg,
-		logger:            observability.NewLogger(nil),
-		webhookSecret:     strings.TrimSpace(cfg.WebhookSecret),
-		webhookURL:        strings.TrimSpace(cfg.WebhookURL),
-		miniAppURL:        strings.TrimSpace(cfg.MiniAppURL),
-		defaultProviderID: strings.TrimSpace(cfg.DefaultProviderID),
-		planTTL:           cfg.PlanTTL,
-		clock:             func() time.Time { return time.Now().UTC() },
-		chatLocks:         make(map[int64]*sync.Mutex),
+		store:         store,
+		interpreter:   interp,
+		provider:      provider,
+		executor:      executor,
+		telegram:      tg,
+		logger:        observability.NewLogger(nil),
+		webhookSecret: strings.TrimSpace(cfg.WebhookSecret),
+		webhookURL:    strings.TrimSpace(cfg.WebhookURL),
+		miniAppURL:    strings.TrimSpace(cfg.MiniAppURL),
+		planTTL:       cfg.PlanTTL,
+		workerTimeout: cfg.WorkerTimeout,
+		clock:         func() time.Time { return time.Now().UTC() },
+		chatLocks:     make(map[int64]*sync.Mutex),
 	}, nil
 }
 
@@ -239,24 +230,74 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
+	w.WriteHeader(http.StatusOK)
 
-	processErr := h.withChatLock(chatID, func() error {
-		switch {
-		case update.Message != nil:
-			return h.handleMessage(r.Context(), update.Message)
-		case update.CallbackQuery != nil:
-			return h.handleCallback(r.Context(), update.CallbackQuery)
-		default:
-			return nil
-		}
+	ackMS := time.Since(started).Milliseconds()
+	h.logInfo(chatID, "", "bot/handler", started, map[string]any{
+		"event":          "update.accepted",
+		"update_id":      update.UpdateID,
+		"webhook_ack_ms": ackMS,
 	})
 
-	if processErr != nil {
-		h.logError(chatID, "", "bot/handler", started, errorKind(processErr), processErr, map[string]any{"stage": "process_update"})
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
-	}
-	w.WriteHeader(http.StatusOK)
+	h.processWG.Add(1)
+	go func(chatID int64, update webhookUpdate) {
+		defer h.processWG.Done()
+
+		processStarted := time.Now()
+		ctx, cancel := context.WithTimeout(context.Background(), h.workerTimeout)
+		defer cancel()
+
+		processErr := h.withChatLock(chatID, func() (retErr error) {
+			duplicate, err := h.isDuplicateUpdate(ctx, chatID, update.UpdateID)
+			if err != nil {
+				return err
+			}
+			if duplicate {
+				h.logInfo(chatID, "", "bot/handler", processStarted, map[string]any{
+					"event":         "update.duplicate_skipped",
+					"update_id":     update.UpdateID,
+					"duplicate":     true,
+					"stage":         "dedupe",
+					"processing_ms": time.Since(processStarted).Milliseconds(),
+				})
+				return nil
+			}
+
+			// Mark update as processed even when downstream handling fails.
+			// This prevents Telegram retry storms from duplicating user-visible errors.
+			defer func() {
+				if markErr := h.markUpdateProcessed(ctx, chatID, update.UpdateID); markErr != nil {
+					if retErr == nil {
+						retErr = markErr
+						return
+					}
+					retErr = errors.Join(retErr, markErr)
+				}
+			}()
+
+			switch {
+			case update.Message != nil:
+				if err := h.handleMessage(ctx, update.Message); err != nil {
+					return err
+				}
+			case update.CallbackQuery != nil:
+				if err := h.handleCallback(ctx, update.CallbackQuery); err != nil {
+					return err
+				}
+			default:
+				return nil
+			}
+			return nil
+		})
+
+		if processErr != nil {
+			h.logError(chatID, "", "bot/handler", processStarted, errorKind(processErr), processErr, map[string]any{
+				"stage":         "process_update",
+				"update_id":     update.UpdateID,
+				"processing_ms": time.Since(processStarted).Milliseconds(),
+			})
+		}
+	}(chatID, update)
 }
 
 func (h *Handler) withChatLock(chatID int64, fn func() error) error {
@@ -288,23 +329,32 @@ func (h *Handler) handleMessage(ctx context.Context, msg *telegramMessageUpdate)
 	if err != nil {
 		return err
 	}
-
-	if msg.WebAppData != nil {
-		return h.handleWebAppData(ctx, s, msg)
+	if s.TelegramUserID > 0 && s.TelegramUserID != msg.From.ID {
+		s.ProviderID = ""
+		s.Timezone = ""
+		s.PendingPlan = nil
+		s.ClarificationCount = 0
+	}
+	s.TelegramUserID = msg.From.ID
+	if s.TelegramUserID <= 0 {
+		if _, sendErr := h.telegram.SendText(ctx, chatID, "Не удалось определить Telegram пользователя\\. Попробуй позже\\.", nil); sendErr != nil {
+			return sendErr
+		}
+		return h.store.Save(ctx, s)
 	}
 
-	if strings.TrimSpace(s.ProviderID) == "" {
-		return h.sendLoginButton(ctx, chatID)
-	}
-	if strings.TrimSpace(s.ProviderID) != h.defaultProviderID {
-		return h.sendLoginButton(ctx, chatID)
-	}
-
-	if strings.TrimSpace(s.Timezone) == "" {
-		if err := h.hydrateSessionProviderInfo(ctx, s); err != nil {
+	actorCtx := h.withActorContext(ctx, s)
+	if strings.TrimSpace(s.ProviderID) == "" || strings.TrimSpace(s.Timezone) == "" {
+		if err := h.hydrateSessionProviderInfo(actorCtx, s); err != nil {
 			h.logError(chatID, "", "bot/handler", time.Now(), errorKind(err), err, map[string]any{"stage": "hydrate_provider_info"})
-			if _, sendErr := h.telegram.SendText(ctx, chatID, FormatError(errorKind(err)), nil); sendErr != nil {
-				return sendErr
+			if errors.Is(err, domain.ErrForbidden) {
+				if _, sendErr := h.telegram.SendText(ctx, chatID, "Нет доступа к операциям специалиста\\. Проверь, что аккаунт активирован как специалист\\.", nil); sendErr != nil {
+					return sendErr
+				}
+			} else {
+				if _, sendErr := h.telegram.SendText(ctx, chatID, FormatError(errorKind(err)), nil); sendErr != nil {
+					return sendErr
+				}
 			}
 			return h.store.Save(ctx, s)
 		}
@@ -321,15 +371,28 @@ func (h *Handler) handleMessage(ctx context.Context, msg *telegramMessageUpdate)
 		ClearPendingPlan(s)
 	}
 
-	_ = h.telegram.Draft(ctx, chatID, "🤔 Анализирую\\.\\.\\.")
-
 	convo := interpreter.ConversationContext{
 		Timezone: s.Timezone,
 		History:  convertHistory(s.DialogHistory),
 	}
-	plan, err := h.interpreter.Interpret(ctx, strings.TrimSpace(msg.Text), convo)
+	progress, stopProgress := h.newStreamProgressReporter(ctx, chatID)
+	defer stopProgress()
+
+	userMessage := strings.TrimSpace(msg.Text)
+	var plan *interpreter.ActionPlan
+	if streamingInterpreter, ok := h.interpreter.(interpreterWithProgress); ok {
+		plan, err = streamingInterpreter.InterpretWithProgress(ctx, userMessage, convo, progress)
+	} else {
+		plan, err = h.interpreter.Interpret(ctx, userMessage, convo)
+	}
 	if err != nil {
 		h.logError(chatID, "", "bot/handler", time.Now(), errorKind(err), err, map[string]any{"stage": "interpret"})
+		if errorKind(err) == "timeout" {
+			h.logInfo(chatID, "", "bot/handler", time.Now(), map[string]any{
+				"event": "interpret.timeout",
+				"stage": "interpret",
+			})
+		}
 		_, sendErr := h.telegram.SendText(ctx, chatID, FormatError(errorKind(err)), nil)
 		if sendErr != nil {
 			return sendErr
@@ -337,9 +400,14 @@ func (h *Handler) handleMessage(ctx context.Context, msg *telegramMessageUpdate)
 		return h.store.Save(ctx, s)
 	}
 
-	AppendHistory(s, "user", msg.Text)
+	if plan.Intent == interpreter.IntentCancelBooking {
+		enrichCancelParamsFromMessage(&plan.Params, userMessage, s.Timezone, h.clock())
+	}
+
+	AppendHistory(s, "user", userMessage)
 
 	if plan.Intent == interpreter.IntentUnknown || plan.Confidence < 0.5 {
+		s.ClarificationCount = 0
 		if _, err := h.telegram.Finalize(ctx, chatID, FormatUnknownIntent(), nil); err != nil {
 			return err
 		}
@@ -347,12 +415,18 @@ func (h *Handler) handleMessage(ctx context.Context, msg *telegramMessageUpdate)
 		return h.store.Save(ctx, s)
 	}
 
+	if plan.Intent == interpreter.IntentCancelBooking && plan.NeedsClarification() && hasCancelDateContext(plan.Params) {
+		plan.Clarifications = nil
+	}
+
 	if plan.NeedsClarification() {
 		s.ClarificationCount++
+		questionText := FormatClarification(plan.Clarifications[0].Question)
 		if s.ClarificationCount >= 2 {
-			return h.sendDeepLinkEscalation(ctx, s, chatID, "clarification_limit", string(plan.Intent))
+			questionText += "\n\n" + escapeV2("Если удобнее, можешь открыть Mini App, но в чате тоже продолжим после твоего ответа.")
+			s.ClarificationCount = 0
 		}
-		if _, err := h.telegram.Finalize(ctx, chatID, FormatClarification(plan.Clarifications[0].Question), nil); err != nil {
+		if _, err := h.telegram.Finalize(ctx, chatID, questionText, nil); err != nil {
 			return err
 		}
 		AppendHistory(s, "assistant", plan.Clarifications[0].Question)
@@ -362,21 +436,154 @@ func (h *Handler) handleMessage(ctx context.Context, msg *telegramMessageUpdate)
 	s.ClarificationCount = 0
 	switch plan.Intent {
 	case interpreter.IntentListBookings:
-		return h.handleListBookings(ctx, s, plan)
+		return h.handleListBookings(actorCtx, s, plan)
 	case interpreter.IntentFindNextSlot:
-		return h.handleFindNextSlot(ctx, s, plan)
+		return h.handleFindNextSlot(actorCtx, s, plan)
 	default:
-		return h.handleWritePreview(ctx, s, plan)
+		return h.handleWritePreview(actorCtx, s, plan)
 	}
+}
+
+func (h *Handler) isDuplicateUpdate(ctx context.Context, chatID int64, updateID int64) (bool, error) {
+	if updateID <= 0 {
+		return false, nil
+	}
+	s, err := LoadOrCreate(ctx, h.store, chatID)
+	if err != nil {
+		return false, err
+	}
+	return s.LastProcessedUpdateID >= updateID, nil
+}
+
+func (h *Handler) markUpdateProcessed(ctx context.Context, chatID int64, updateID int64) error {
+	if updateID <= 0 {
+		return nil
+	}
+	s, err := LoadOrCreate(ctx, h.store, chatID)
+	if err != nil {
+		return err
+	}
+	if updateID <= s.LastProcessedUpdateID {
+		return nil
+	}
+	s.LastProcessedUpdateID = updateID
+	return h.store.Save(ctx, s)
+}
+
+func (h *Handler) newStreamProgressReporter(ctx context.Context, chatID int64) (func(interpreter.Progress), func()) {
+	var (
+		mu         sync.Mutex
+		lastAt     time.Time
+		lastKey    string
+		onceStop   sync.Once
+		startedAt  = time.Now()
+		stageIndex int
+		disabled   bool
+	)
+
+	stages := []string{
+		"🤔 Анализирую\\.\\.\\.",
+		"🤔 Уточняю детали\\.\\.\\.",
+		"🤔 Готовлю ответ\\.\\.\\.",
+	}
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+
+	sendDraft := func(text, stage string) {
+		mu.Lock()
+		if disabled {
+			mu.Unlock()
+			return
+		}
+		now := time.Now()
+		if !lastAt.IsZero() && now.Sub(lastAt) < 1800*time.Millisecond {
+			mu.Unlock()
+			return
+		}
+		if text == lastKey {
+			mu.Unlock()
+			return
+		}
+		mu.Unlock()
+
+		if err := h.telegram.Draft(ctx, chatID, text); err != nil {
+			mu.Lock()
+			disabled = true
+			lastAt = now
+			lastKey = text
+			mu.Unlock()
+
+			h.logError(chatID, "", "bot/handler", now, "ErrUpstream", err, map[string]any{
+				"event": "draft.failed",
+				"stage": stage,
+				"note":  "draft_disabled_for_request",
+			})
+			_ = h.telegram.SendChatAction(ctx, chatID, "typing")
+			return
+		}
+
+		mu.Lock()
+		lastAt = now
+		lastKey = text
+		mu.Unlock()
+	}
+
+	sendDraft(stages[0], "draft_start")
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-done:
+				return
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				mu.Lock()
+				if stageIndex < len(stages)-1 {
+					stageIndex++
+				}
+				next := stages[stageIndex]
+				mu.Unlock()
+				sendDraft(next, "heartbeat")
+			}
+		}
+	}()
+
+	progressFn := func(progress interpreter.Progress) {
+		now := time.Now()
+		elapsed := now.Sub(progress.StartedAt)
+		if progress.StartedAt.IsZero() {
+			elapsed = now.Sub(startedAt)
+		}
+
+		text := stages[0]
+		switch {
+		case progress.ChunkCount >= 24 || elapsed >= 20*time.Second:
+			text = stages[2]
+		case progress.ChunkCount >= 8 || elapsed >= 8*time.Second:
+			text = stages[1]
+		}
+		sendDraft(text, "progress")
+	}
+
+	stopFn := func() {
+		onceStop.Do(func() {
+			close(done)
+			wg.Wait()
+		})
+	}
+
+	return progressFn, stopFn
 }
 
 func (h *Handler) handleListBookings(ctx context.Context, s *session.Session, plan *interpreter.ActionPlan) error {
 	chatID := s.ChatID
-	if isLongRange(plan.Params.DateRange, s.Timezone) {
-		return h.sendDeepLinkEscalation(ctx, s, chatID, "bookings", "range_gt_7d")
-	}
-
-	filter, err := buildBookingFilter(plan.Params, s.Timezone, h.clock())
+	filter, clampedToWeek, err := buildBookingFilter(plan.Params, s.Timezone, h.clock())
 	if err != nil {
 		h.logError(chatID, string(plan.Intent), "bot/handler", time.Now(), errorKind(err), err, map[string]any{"stage": "build_booking_filter"})
 		if _, sendErr := h.telegram.SendText(ctx, chatID, FormatError(errorKind(err)), nil); sendErr != nil {
@@ -399,7 +606,18 @@ func (h *Handler) handleListBookings(ctx context.Context, s *session.Session, pl
 		location = time.UTC
 	}
 	text := FormatBookingListPreview(bookings, location)
-	if _, err := h.telegram.Finalize(ctx, chatID, text, nil); err != nil {
+	var keyboard *InlineKeyboardMarkup
+	if clampedToWeek {
+		text += "\n\n" + renderBody("Показал ближайшие 7 дней. Если нужен более широкий период, можно открыть приложение.")
+		link := h.BuildDeepLink("bookings", "range_gt_7d")
+		markup := InlineKeyboardMarkup{
+			InlineKeyboard: [][]InlineKeyboardButton{
+				{NewWebAppButton("Открыть в приложении →", link)},
+			},
+		}
+		keyboard = &markup
+	}
+	if _, err := h.telegram.Finalize(ctx, chatID, text, keyboard); err != nil {
 		return err
 	}
 
@@ -472,20 +690,28 @@ func (h *Handler) handleWritePreview(ctx context.Context, s *session.Session, pl
 		return h.store.Save(ctx, s)
 	}
 
-	if plan.Intent != interpreter.IntentCreateBooking &&
-		preview.AvailabilityChange.AddedSlots+preview.AvailabilityChange.RemovedSlots > 20 {
-		return h.sendDeepLinkEscalation(ctx, s, chatID, "availability", "impact_gt_20")
-	}
+	highAvailabilityImpact := (plan.Intent == interpreter.IntentSetWorkingHours ||
+		plan.Intent == interpreter.IntentAddBreak ||
+		plan.Intent == interpreter.IntentCloseRange) &&
+		(preview.AvailabilityChange.AddedSlots+preview.AvailabilityChange.RemovedSlots > 20)
 
 	pending := SetPendingPlan(s, *plan, 0, "", &PendingPlanOptions{
-		SlotCandidates: preview.ProposedSlots,
-		Availability:   preview.AvailabilityExec,
+		SlotCandidates:    preview.ProposedSlots,
+		BookingCandidates: preview.BookingCandidates,
+		Availability:      preview.AvailabilityExec,
 	})
 	pending.IdempotencyKey = buildIdempotencyKey(chatID, pending.ID, plan.Intent)
 
 	location, _ := time.LoadLocation(s.Timezone)
 	if location == nil {
 		location = time.UTC
+	}
+	if plan.Intent == interpreter.IntentSetWorkingHours ||
+		plan.Intent == interpreter.IntentAddBreak ||
+		plan.Intent == interpreter.IntentCloseRange {
+		if summary := humanAvailabilityIntentSummary(plan.Intent, plan.Params, location); summary != "" {
+			preview.Summary = summary
+		}
 	}
 
 	if plan.Intent == interpreter.IntentCreateBooking {
@@ -510,6 +736,18 @@ func (h *Handler) handleWritePreview(ctx context.Context, s *session.Session, pl
 		return h.store.Save(ctx, s)
 	}
 
+	if plan.Intent == interpreter.IntentCancelBooking && len(preview.BookingCandidates) > 1 {
+		keyboard := BuildBookingCandidatesKeyboard(pending.ID, preview.BookingCandidates, location)
+		text := FormatCancelCandidates(preview.BookingCandidates, location)
+		msgID, finalizeErr := h.telegram.Finalize(ctx, chatID, text, &keyboard)
+		if finalizeErr != nil {
+			return finalizeErr
+		}
+		pending.PreviewMsgID = msgID
+		AppendHistory(s, "assistant", text)
+		return h.store.Save(ctx, s)
+	}
+
 	if plan.Intent == interpreter.IntentCancelBooking && preview.BookingResult != nil &&
 		strings.TrimSpace(pending.Plan.Params.BookingID) == "" {
 		pending.Plan.Params.BookingID = strings.TrimSpace(preview.BookingResult.ID)
@@ -517,6 +755,12 @@ func (h *Handler) handleWritePreview(ctx context.Context, s *session.Session, pl
 
 	keyboard := BuildPreviewKeyboard(pending.ID)
 	text := formatPreviewByIntent(*preview, plan.Intent, location)
+	if highAvailabilityImpact {
+		text += "\n\n⚠️ Рекомендация: для большого объёма изменений проверь детали в приложении, затем подтверди здесь или в Mini App\\."
+		keyboard.InlineKeyboard = append(keyboard.InlineKeyboard, []InlineKeyboardButton{
+			NewWebAppButton("Открыть в приложении →", h.BuildDeepLink("availability", "impact_gt_20")),
+		})
+	}
 	msgID, err := h.telegram.Finalize(ctx, chatID, text, &keyboard)
 	if err != nil {
 		return err
@@ -554,6 +798,22 @@ func (h *Handler) handleCallback(ctx context.Context, cb *telegramCallbackQueryU
 	if err != nil {
 		return err
 	}
+	if s.TelegramUserID > 0 && s.TelegramUserID != cb.From.ID {
+		s.ProviderID = ""
+		s.Timezone = ""
+		s.PendingPlan = nil
+		s.ClarificationCount = 0
+	}
+	s.TelegramUserID = cb.From.ID
+	actorCtx := h.withActorContext(ctx, s)
+	if strings.TrimSpace(s.ProviderID) == "" || strings.TrimSpace(s.Timezone) == "" {
+		if err := h.hydrateSessionProviderInfo(actorCtx, s); err != nil {
+			if _, sendErr := h.telegram.SendText(ctx, chatID, FormatError(errorKind(err)), nil); sendErr != nil {
+				return sendErr
+			}
+			return h.store.Save(ctx, s)
+		}
+	}
 	if s.PendingPlan == nil || s.PendingPlan.ID != parsed.PlanID {
 		_, sendErr := h.telegram.SendText(ctx, chatID, "Запрос устарел, повтори заново\\.", nil)
 		if sendErr != nil {
@@ -572,7 +832,7 @@ func (h *Handler) handleCallback(ctx context.Context, cb *telegramCallbackQueryU
 
 	switch parsed.Type {
 	case CallbackTypeCancel:
-		if err := h.telegram.EditMessageReplyMarkup(ctx, chatID, s.PendingPlan.PreviewMsgID, &InlineKeyboardMarkup{InlineKeyboard: [][]InlineKeyboardButton{}}); err != nil {
+		if err := h.clearPreviewKeyboard(ctx, chatID, s.PendingPlan.PreviewMsgID); err != nil {
 			return err
 		}
 		if _, err := h.telegram.SendText(ctx, chatID, "Понял, ничего не изменено\\.", nil); err != nil {
@@ -582,8 +842,10 @@ func (h *Handler) handleCallback(ctx context.Context, cb *telegramCallbackQueryU
 		return h.store.Save(ctx, s)
 	case CallbackTypeSlot:
 		return h.handleSlotSelection(ctx, s, parsed.SlotIndex)
+	case CallbackTypeBooking:
+		return h.handleBookingSelection(ctx, s, parsed.BookingIndex)
 	case CallbackTypeConfirm:
-		return h.handleConfirm(ctx, s)
+		return h.handleConfirm(actorCtx, s)
 	default:
 		return nil
 	}
@@ -623,7 +885,7 @@ func (h *Handler) handleSlotSelection(ctx context.Context, s *session.Session, i
 		Start:     start.UTC(),
 		End:       end.UTC(),
 	}
-	if err := h.telegram.EditMessageReplyMarkup(ctx, s.ChatID, s.PendingPlan.PreviewMsgID, &InlineKeyboardMarkup{InlineKeyboard: [][]InlineKeyboardButton{}}); err != nil {
+	if err := h.clearPreviewKeyboard(ctx, s.ChatID, s.PendingPlan.PreviewMsgID); err != nil {
 		return err
 	}
 
@@ -653,8 +915,60 @@ func (h *Handler) handleSlotSelection(ctx context.Context, s *session.Session, i
 	return h.store.Save(ctx, s)
 }
 
+func (h *Handler) handleBookingSelection(ctx context.Context, s *session.Session, idx int) error {
+	if s == nil || s.PendingPlan == nil {
+		return errors.New("bot handler: pending plan is required for booking selection")
+	}
+	if idx < 0 || idx >= len(s.PendingPlan.BookingCandidates) {
+		if _, err := h.telegram.SendText(ctx, s.ChatID, renderBody("Этот вариант уже недоступен\\. Выбери другой или сформируй запрос заново\\."), nil); err != nil {
+			return err
+		}
+		return nil
+	}
+
+	selectedRaw := s.PendingPlan.BookingCandidates[idx]
+	at, err := time.Parse(time.RFC3339, strings.TrimSpace(selectedRaw.At))
+	if err != nil {
+		return errors.Join(domain.ErrValidation, errors.New("bot handler: invalid pending booking candidate time"))
+	}
+
+	if err := h.clearPreviewKeyboard(ctx, s.ChatID, s.PendingPlan.PreviewMsgID); err != nil {
+		return err
+	}
+
+	pending := s.PendingPlan
+	pending.Plan.Intent = interpreter.IntentCancelBooking
+	pending.Plan.RequiresConfirm = true
+	pending.Plan.Params.BookingID = strings.TrimSpace(selectedRaw.ID)
+	pending.Plan.Params.ClientName = strings.TrimSpace(selectedRaw.ClientName)
+	pending.Plan.Params.ApproximateTime = at.UTC().Format(time.RFC3339)
+	pending.IdempotencyKey = buildIdempotencyKey(s.ChatID, pending.ID, pending.Plan.Intent)
+
+	location, _ := time.LoadLocation(s.Timezone)
+	if location == nil {
+		location = time.UTC
+	}
+	preview := domain.Preview{
+		BookingResult: &domain.Booking{
+			ID:          strings.TrimSpace(selectedRaw.ID),
+			ClientName:  strings.TrimSpace(selectedRaw.ClientName),
+			ServiceName: strings.TrimSpace(selectedRaw.ServiceName),
+			At:          at.UTC(),
+		},
+	}
+	text := FormatCancelPreview(preview, location)
+	keyboard := BuildPreviewKeyboard(pending.ID)
+	msgID, finalizeErr := h.telegram.Finalize(ctx, s.ChatID, text, &keyboard)
+	if finalizeErr != nil {
+		return finalizeErr
+	}
+	pending.PreviewMsgID = msgID
+	AppendHistory(s, "assistant", text)
+	return h.store.Save(ctx, s)
+}
+
 func (h *Handler) handleConfirm(ctx context.Context, s *session.Session) error {
-	if err := h.telegram.EditMessageReplyMarkup(ctx, s.ChatID, s.PendingPlan.PreviewMsgID, &InlineKeyboardMarkup{InlineKeyboard: [][]InlineKeyboardButton{}}); err != nil {
+	if err := h.clearPreviewKeyboard(ctx, s.ChatID, s.PendingPlan.PreviewMsgID); err != nil {
 		return err
 	}
 	if _, err := h.telegram.SendText(ctx, s.ChatID, "Выполняю\\.\\.\\.", nil); err != nil {
@@ -665,7 +979,7 @@ func (h *Handler) handleConfirm(ctx context.Context, s *session.Session) error {
 	if err != nil {
 		h.logError(s.ChatID, string(s.PendingPlan.Plan.Intent), "bot/handler", time.Now(), errorKind(err), err, map[string]any{"stage": "execute_confirmed"})
 		if errors.Is(err, ErrExecutionPolicyViolation) {
-			_, sendErr := h.telegram.SendText(ctx, s.ChatID, "Не удалось применить изменения\\. Причина: policy violation\\.", nil)
+			_, sendErr := h.telegram.SendText(ctx, s.ChatID, renderBody("Команду получил, но ACP отклонил выполнение по policy.\nПроверь формулировку и попробуй снова."), nil)
 			return sendErr
 		}
 		if errors.Is(err, ErrExecutionContractBlocked) {
@@ -675,7 +989,7 @@ func (h *Handler) handleConfirm(ctx context.Context, s *session.Session) error {
 					{NewWebAppButton("Открыть в приложении →", link)},
 				},
 			}
-			if _, sendErr := h.telegram.SendText(ctx, s.ChatID, "Эта операция временно недоступна в текущем контракте API\\. Открой приложение для выполнения\\.", &keyboard); sendErr != nil {
+			if _, sendErr := h.telegram.SendText(ctx, s.ChatID, renderBody("Эту операцию пока нельзя завершить в чате из-за ограничений API.\nОткрой приложение кнопкой ниже — там действие доступно."), &keyboard); sendErr != nil {
 				return sendErr
 			}
 			ClearPendingPlan(s)
@@ -697,16 +1011,39 @@ func (h *Handler) handleConfirm(ctx context.Context, s *session.Session) error {
 		return h.store.Save(ctx, s)
 	}
 
-	message := "Готово\\. Изменения применены\\."
+	actionMessage := "Изменения успешно применены."
 	if result != nil && strings.TrimSpace(result.Message) != "" {
-		message = escapeV2(strings.TrimSpace(result.Message))
+		actionMessage = strings.TrimSpace(result.Message)
 	}
+	message := renderBody(actionMessage + "\nМожно отправить следующую команду в чат.")
 	if _, err := h.telegram.SendText(ctx, s.ChatID, message, nil); err != nil {
 		return err
 	}
 
 	ClearPendingPlan(s)
 	return h.store.Save(ctx, s)
+}
+
+func (h *Handler) clearPreviewKeyboard(ctx context.Context, chatID int64, messageID int64) error {
+	err := h.telegram.EditMessageReplyMarkup(ctx, chatID, messageID, &InlineKeyboardMarkup{InlineKeyboard: [][]InlineKeyboardButton{}})
+	if err == nil {
+		return nil
+	}
+	if isMessageNotModified(err) {
+		h.logInfo(chatID, "", "bot/handler", time.Now(), map[string]any{
+			"event":      "reply_markup.noop",
+			"message_id": messageID,
+		})
+		return nil
+	}
+	return err
+}
+
+func isMessageNotModified(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "message is not modified")
 }
 
 func (h *Handler) BuildDeepLink(action, contextValue string) string {
@@ -728,7 +1065,7 @@ func (h *Handler) sendDeepLinkEscalation(ctx context.Context, s *session.Session
 			{NewWebAppButton("Открыть в приложении →", link)},
 		},
 	}
-	text := "Для этого шага удобнее перейти в приложение\\."
+	text := renderBody("Этот сценарий удобнее завершить в приложении.\nОткрой Mini App кнопкой ниже — контекст уже передан.")
 	if _, err := h.telegram.SendText(ctx, chatID, text, &keyboard); err != nil {
 		return err
 	}
@@ -741,7 +1078,7 @@ func formatPreviewByIntent(preview domain.Preview, intent interpreter.Intent, tz
 	case interpreter.IntentCreateBooking:
 		return FormatCreatePreview(preview, tz)
 	case interpreter.IntentCancelBooking:
-		return FormatCancelPreview(preview)
+		return FormatCancelPreview(preview, tz)
 	default:
 		return FormatAvailabilityPreview(preview)
 	}
@@ -752,14 +1089,14 @@ func buildRetryKeyboard(planID string) InlineKeyboardMarkup {
 		InlineKeyboard: [][]InlineKeyboardButton{
 			{
 				{
-					Text:         "🔁 Повторить",
-					CallbackData: ConfirmData(planID),
-					Style:        buttonStyleSuccess,
-				},
-				{
 					Text:         "❌ Отменить",
 					CallbackData: CancelData(planID),
 					Style:        buttonStyleDanger,
+				},
+				{
+					Text:         "🔁 Повторить",
+					CallbackData: ConfirmData(planID),
+					Style:        buttonStyleSuccess,
 				},
 			},
 		},
@@ -822,84 +1159,262 @@ func mapActionParams(p interpreter.ActionParams) domain.ActionParams {
 	return out
 }
 
-type webAppAuthPayload struct {
-	Token        string `json:"token"`
-	RefreshToken string `json:"refreshToken"`
-	SpecialistID string `json:"specialistId"`
+func hasCancelDateContext(p interpreter.ActionParams) bool {
+	if strings.TrimSpace(p.ApproximateTime) != "" {
+		return true
+	}
+	if p.DateRange != nil && strings.TrimSpace(p.DateRange.From) != "" {
+		return true
+	}
+	return false
 }
 
-func (h *Handler) handleWebAppData(ctx context.Context, s *session.Session, msg *telegramMessageUpdate) error {
-	if msg == nil || msg.WebAppData == nil {
-		return nil
+func enrichCancelParamsFromMessage(params *interpreter.ActionParams, rawMessage, tzName string, now time.Time) {
+	if params == nil {
+		return
 	}
-	chatID := msg.Chat.ID
-
-	var payload webAppAuthPayload
-	if err := json.Unmarshal([]byte(msg.WebAppData.Data), &payload); err != nil {
-		_, _ = h.telegram.SendText(ctx, chatID, "Не удалось войти\\. Попробуй ещё раз\\.", nil)
-		return h.sendLoginButton(ctx, chatID)
+	text := strings.TrimSpace(strings.ToLower(rawMessage))
+	if text == "" {
+		return
 	}
-
-	payload.Token = strings.TrimSpace(payload.Token)
-	payload.RefreshToken = strings.TrimSpace(payload.RefreshToken)
-	payload.SpecialistID = strings.TrimSpace(payload.SpecialistID)
-	if payload.Token == "" || payload.SpecialistID == "" {
-		_, _ = h.telegram.SendText(ctx, chatID, "Не удалось войти\\. Попробуй ещё раз\\.", nil)
-		return h.sendLoginButton(ctx, chatID)
-	}
-	if payload.SpecialistID != h.defaultProviderID {
-		_, _ = h.telegram.SendText(ctx, chatID, "Этот аккаунт не поддерживается в текущей конфигурации бота\\.", nil)
-		return h.sendLoginButton(ctx, chatID)
+	if hasCancelDateContext(*params) {
+		return
 	}
 
-	if err := h.tokenStore.SaveToken(ctx, payload.SpecialistID, AuthToken{
-		AccessToken:  payload.Token,
-		RefreshToken: payload.RefreshToken,
-	}); err != nil {
-		return err
-	}
-
-	s.ProviderID = payload.SpecialistID
-	if err := h.hydrateSessionProviderInfo(ctx, s); err != nil {
-		h.logError(chatID, "", "bot/handler", time.Now(), errorKind(err), err, map[string]any{"stage": "auth_hydrate_provider_info"})
-		if _, sendErr := h.telegram.SendText(ctx, chatID, "Вход выполнен, но профиль специалиста пока недоступен\\. Попробуй ещё раз\\.", nil); sendErr != nil {
-			return sendErr
+	loc := time.UTC
+	if strings.TrimSpace(tzName) != "" {
+		if loaded, err := time.LoadLocation(strings.TrimSpace(tzName)); err == nil {
+			loc = loaded
 		}
-		return h.store.Save(ctx, s)
 	}
 
-	if err := h.store.Save(ctx, s); err != nil {
-		return err
+	date, ok := parseCancelDateFromText(text, now.In(loc), loc)
+	if ok {
+		dateValue := date.Format("2006-01-02")
+		params.DateRange = &interpreter.DateRange{From: dateValue, To: dateValue}
 	}
-	_, err := h.telegram.SendText(ctx, chatID, "Вошёл\\. Теперь можешь управлять записями\\.", nil)
-	return err
+
+	clockMatch := reCancelClock.FindStringSubmatch(text)
+	if len(clockMatch) == 3 && params.DateRange != nil {
+		hours := strings.TrimSpace(clockMatch[1])
+		minutes := strings.TrimSpace(clockMatch[2])
+		if len(hours) == 1 {
+			hours = "0" + hours
+		}
+		clock := fmt.Sprintf("%s:%s", hours, minutes)
+		if ts, err := time.ParseInLocation("2006-01-02 15:04", params.DateRange.From+" "+clock, loc); err == nil {
+			params.ApproximateTime = ts.UTC().Format(time.RFC3339)
+		}
+	}
 }
 
-func (h *Handler) sendLoginButton(ctx context.Context, chatID int64) error {
-	link := strings.TrimSpace(h.miniAppURL)
-	if strings.Contains(link, "?") {
-		link += "&mode=bot_auth"
-	} else {
-		link += "?mode=bot_auth"
+func parseCancelDateFromText(text string, now time.Time, loc *time.Location) (time.Time, bool) {
+	if loc == nil {
+		loc = time.UTC
 	}
-	keyboard := InlineKeyboardMarkup{
-		InlineKeyboard: [][]InlineKeyboardButton{
-			{NewWebAppButton("Войти в Bookably", link)},
-		},
+
+	if match := reCancelNumericDate.FindStringSubmatch(text); len(match) >= 3 {
+		day, dayErr := parseTwoDigitNumber(match[1], 1, 31)
+		month, monthErr := parseTwoDigitNumber(match[2], 1, 12)
+		if dayErr == nil && monthErr == nil {
+			year := now.Year()
+			if strings.TrimSpace(match[3]) != "" {
+				if y, yErr := parseYearNumber(match[3]); yErr == nil {
+					year = y
+				}
+			}
+			candidate := time.Date(year, time.Month(month), day, 0, 0, 0, 0, loc)
+			if strings.TrimSpace(match[3]) == "" && candidate.Before(now.AddDate(0, -1, 0)) {
+				candidate = candidate.AddDate(1, 0, 0)
+			}
+			return candidate, true
+		}
 	}
-	_, err := h.telegram.SendText(ctx, chatID, "Чтобы начать, войди в свой аккаунт Bookably\\.", &keyboard)
-	return err
+
+	if match := reCancelTextDate.FindStringSubmatch(text); len(match) >= 3 {
+		day, dayErr := parseTwoDigitNumber(match[1], 1, 31)
+		month, ok := parseRuMonth(match[2])
+		if dayErr == nil && ok {
+			candidate := time.Date(now.Year(), time.Month(month), day, 0, 0, 0, 0, loc)
+			if candidate.Before(now.AddDate(0, -1, 0)) {
+				candidate = candidate.AddDate(1, 0, 0)
+			}
+			return candidate, true
+		}
+	}
+
+	if strings.Contains(text, "сегодня") {
+		return time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc), true
+	}
+	if strings.Contains(text, "завтра") {
+		value := now.AddDate(0, 0, 1)
+		return time.Date(value.Year(), value.Month(), value.Day(), 0, 0, 0, 0, loc), true
+	}
+	if strings.Contains(text, "послезавтра") {
+		value := now.AddDate(0, 0, 2)
+		return time.Date(value.Year(), value.Month(), value.Day(), 0, 0, 0, 0, loc), true
+	}
+	return time.Time{}, false
+}
+
+func parseTwoDigitNumber(raw string, min int, max int) (int, error) {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return 0, errors.New("empty")
+	}
+	parsed := 0
+	for _, r := range value {
+		if r < '0' || r > '9' {
+			return 0, errors.New("non-digit")
+		}
+		parsed = parsed*10 + int(r-'0')
+	}
+	if parsed < min || parsed > max {
+		return 0, errors.New("out-of-range")
+	}
+	return parsed, nil
+}
+
+func parseYearNumber(raw string) (int, error) {
+	year, err := parseTwoDigitNumber(raw, 0, 9999)
+	if err != nil {
+		return 0, err
+	}
+	if year < 100 {
+		return 2000 + year, nil
+	}
+	return year, nil
+}
+
+func parseRuMonth(raw string) (int, bool) {
+	value := strings.TrimSpace(strings.ToLower(raw))
+	switch {
+	case strings.HasPrefix(value, "январ"):
+		return 1, true
+	case strings.HasPrefix(value, "феврал"):
+		return 2, true
+	case strings.HasPrefix(value, "март"):
+		return 3, true
+	case strings.HasPrefix(value, "апрел"):
+		return 4, true
+	case strings.HasPrefix(value, "ма"):
+		return 5, true
+	case strings.HasPrefix(value, "июн"):
+		return 6, true
+	case strings.HasPrefix(value, "июл"):
+		return 7, true
+	case strings.HasPrefix(value, "август"):
+		return 8, true
+	case strings.HasPrefix(value, "сентябр"):
+		return 9, true
+	case strings.HasPrefix(value, "октябр"):
+		return 10, true
+	case strings.HasPrefix(value, "ноябр"):
+		return 11, true
+	case strings.HasPrefix(value, "декабр"):
+		return 12, true
+	default:
+		return 0, false
+	}
+}
+
+func humanAvailabilityIntentSummary(intent interpreter.Intent, p interpreter.ActionParams, tz *time.Location) string {
+	if p.DateRange == nil || strings.TrimSpace(p.DateRange.From) == "" {
+		return ""
+	}
+	from, to, ok := parseIntentDateRange(p.DateRange, tz)
+	if !ok {
+		return ""
+	}
+
+	datePart := humanDateSpan(from, to)
+	switch intent {
+	case interpreter.IntentSetWorkingHours:
+		if p.WorkingHours == nil {
+			return datePart
+		}
+		return fmt.Sprintf("%s с %s до %s", datePart, strings.TrimSpace(p.WorkingHours.From), strings.TrimSpace(p.WorkingHours.To))
+	case interpreter.IntentAddBreak:
+		breakSlot := p.BreakSlot
+		if breakSlot == nil && len(p.Breaks) > 0 {
+			breakSlot = &p.Breaks[0]
+		}
+		if breakSlot == nil {
+			return datePart
+		}
+		return fmt.Sprintf("%s, перерыв с %s до %s", datePart, strings.TrimSpace(breakSlot.From), strings.TrimSpace(breakSlot.To))
+	case interpreter.IntentCloseRange:
+		if p.TimeRange != nil && strings.TrimSpace(p.TimeRange.From) != "" && strings.TrimSpace(p.TimeRange.To) != "" {
+			return fmt.Sprintf("%s, закрыть с %s до %s", datePart, strings.TrimSpace(p.TimeRange.From), strings.TrimSpace(p.TimeRange.To))
+		}
+		return fmt.Sprintf("%s, закрыть день", datePart)
+	default:
+		return ""
+	}
+}
+
+func parseIntentDateRange(r *interpreter.DateRange, tz *time.Location) (time.Time, time.Time, bool) {
+	loc := tz
+	if loc == nil {
+		loc = time.UTC
+	}
+	from, err := time.ParseInLocation("2006-01-02", strings.TrimSpace(r.From), loc)
+	if err != nil {
+		return time.Time{}, time.Time{}, false
+	}
+	to := from
+	if strings.TrimSpace(r.To) != "" {
+		parsedTo, err := time.ParseInLocation("2006-01-02", strings.TrimSpace(r.To), loc)
+		if err != nil {
+			return time.Time{}, time.Time{}, false
+		}
+		to = parsedTo
+	}
+	if to.Before(from) {
+		return time.Time{}, time.Time{}, false
+	}
+	return from, to, true
+}
+
+func humanDateSpan(from, to time.Time) string {
+	if from.Year() == to.Year() && from.YearDay() == to.YearDay() {
+		return humanDateOnly(from)
+	}
+	return fmt.Sprintf("с %s по %s", humanDateOnly(from), humanDateOnly(to))
+}
+
+func humanDateOnly(ts time.Time) string {
+	months := []string{
+		"",
+		"января",
+		"февраля",
+		"марта",
+		"апреля",
+		"мая",
+		"июня",
+		"июля",
+		"августа",
+		"сентября",
+		"октября",
+		"ноября",
+		"декабря",
+	}
+	month := months[int(ts.Month())]
+	return fmt.Sprintf("%d %s", ts.Day(), month)
+}
+
+func (h *Handler) withActorContext(ctx context.Context, s *session.Session) context.Context {
+	if s == nil || s.TelegramUserID <= 0 {
+		return ctx
+	}
+	return actorctx.WithTelegramUserID(ctx, s.TelegramUserID)
 }
 
 func (h *Handler) hydrateSessionProviderInfo(ctx context.Context, s *session.Session) error {
 	if s == nil {
 		return errors.New("bot handler: session is nil")
 	}
-	providerID := strings.TrimSpace(s.ProviderID)
-	if providerID == "" {
-		return errors.Join(domain.ErrValidation, errors.New("provider_id is required"))
-	}
-	info, err := h.provider.GetProviderInfo(ctx, providerID)
+	info, err := h.provider.GetProviderInfo(ctx, strings.TrimSpace(s.ProviderID))
 	if err != nil {
 		return err
 	}
@@ -917,7 +1432,7 @@ func (h *Handler) hydrateSessionProviderInfo(ctx context.Context, s *session.Ses
 	return nil
 }
 
-func buildBookingFilter(params interpreter.ActionParams, tzName string, now time.Time) (domain.BookingFilter, error) {
+func buildBookingFilter(params interpreter.ActionParams, tzName string, now time.Time) (domain.BookingFilter, bool, error) {
 	loc := time.UTC
 	if strings.TrimSpace(tzName) != "" {
 		if l, err := time.LoadLocation(tzName); err == nil {
@@ -925,31 +1440,50 @@ func buildBookingFilter(params interpreter.ActionParams, tzName string, now time
 		}
 	}
 
+	status := strings.TrimSpace(params.Status)
+	if status == "" {
+		status = "upcoming"
+	}
+
 	from := now.In(loc)
 	to := from
+	hadExplicitRange := false
 	if params.DateRange != nil && strings.TrimSpace(params.DateRange.From) != "" {
+		hadExplicitRange = true
 		parsedFrom, err := time.ParseInLocation("2006-01-02", params.DateRange.From, loc)
 		if err != nil {
-			return domain.BookingFilter{}, errors.Join(domain.ErrValidation, err)
+			return domain.BookingFilter{}, false, errors.Join(domain.ErrValidation, err)
 		}
 		from = parsedFrom
 		if strings.TrimSpace(params.DateRange.To) != "" {
 			parsedTo, err := time.ParseInLocation("2006-01-02", params.DateRange.To, loc)
 			if err != nil {
-				return domain.BookingFilter{}, errors.Join(domain.ErrValidation, err)
+				return domain.BookingFilter{}, false, errors.Join(domain.ErrValidation, err)
 			}
 			to = parsedTo
 		} else {
 			to = parsedFrom
 		}
+	} else {
+		switch strings.ToLower(status) {
+		case "past":
+			to = from
+			from = from.AddDate(0, 0, -6)
+		default:
+			to = from.AddDate(0, 0, 6)
+		}
+	}
+
+	clampedToWeek := false
+	if hadExplicitRange {
+		if spanDays := int(to.Sub(from).Hours()/24) + 1; spanDays > 7 {
+			to = from.AddDate(0, 0, 6)
+			clampedToWeek = true
+		}
 	}
 
 	start := time.Date(from.Year(), from.Month(), from.Day(), 0, 0, 0, 0, loc).UTC()
 	end := time.Date(to.Year(), to.Month(), to.Day(), 23, 59, 59, 0, loc).UTC()
-	status := strings.TrimSpace(params.Status)
-	if status == "" {
-		status = "upcoming"
-	}
 	direction := "future"
 	if strings.EqualFold(status, "past") {
 		direction = "past"
@@ -960,7 +1494,7 @@ func buildBookingFilter(params interpreter.ActionParams, tzName string, now time
 		Status:    status,
 		Direction: direction,
 		Limit:     50,
-	}, nil
+	}, clampedToWeek, nil
 }
 
 func buildSlotSearchRequest(params interpreter.ActionParams, now time.Time) (domain.SlotSearchRequest, error) {
@@ -1036,6 +1570,8 @@ func errorKind(err error) string {
 		return "upstream"
 	case errors.Is(err, context.DeadlineExceeded):
 		return "timeout"
+	case errors.Is(err, domain.ErrForbidden), errors.Is(err, domain.ErrUnauthorized):
+		return "forbidden"
 	case errors.Is(err, domain.ErrNotFound):
 		return "not_found"
 	case errors.Is(err, domain.ErrConflict):
@@ -1066,6 +1602,63 @@ func (h *Handler) logError(chatID int64, intent, component string, started time.
 		ErrorType:  errType,
 		Error:      err,
 		Fields:     fields,
+	})
+}
+
+func (h *Handler) logInfo(chatID int64, intent, component string, started time.Time, fields map[string]any) {
+	if h == nil || h.logger == nil {
+		return
+	}
+	duration := int64(0)
+	if !started.IsZero() {
+		duration = time.Since(started).Milliseconds()
+	}
+	h.logger.LogInfo(observability.Entry{
+		TraceID:    newTraceID(),
+		ChatID:     chatID,
+		Intent:     strings.TrimSpace(intent),
+		Component:  component,
+		DurationMS: duration,
+		Fields:     fields,
+	})
+}
+
+func (h *Handler) WaitForIdle(timeout time.Duration) bool {
+	if h == nil {
+		return true
+	}
+	if timeout <= 0 {
+		timeout = 3 * time.Second
+	}
+	done := make(chan struct{})
+	go func() {
+		h.processWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
+}
+
+func (h *Handler) logAuthEvent(chatID int64, event string, fields map[string]any) {
+	if h == nil || h.logger == nil {
+		return
+	}
+	payload := map[string]any{
+		"event": strings.TrimSpace(event),
+	}
+	for k, v := range fields {
+		payload[k] = v
+	}
+	h.logger.LogInfo(observability.Entry{
+		TraceID:    newTraceID(),
+		ChatID:     chatID,
+		Component:  "bot/auth",
+		DurationMS: 0,
+		Fields:     payload,
 	})
 }
 

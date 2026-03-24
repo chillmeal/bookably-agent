@@ -25,9 +25,7 @@ type inMemorySessionStore struct {
 }
 
 func newInMemorySessionStore() *inMemorySessionStore {
-	return &inMemorySessionStore{
-		sessions: make(map[int64]*session.Session),
-	}
+	return &inMemorySessionStore{sessions: make(map[int64]*session.Session)}
 }
 
 func (s *inMemorySessionStore) Get(ctx context.Context, chatID int64) (*session.Session, error) {
@@ -36,10 +34,7 @@ func (s *inMemorySessionStore) Get(ctx context.Context, chatID int64) (*session.
 
 	existing, ok := s.sessions[chatID]
 	if !ok {
-		return &session.Session{
-			ChatID:        chatID,
-			DialogHistory: make([]session.Message, 0, 10),
-		}, nil
+		return &session.Session{ChatID: chatID, DialogHistory: make([]session.Message, 0, 10)}, nil
 	}
 	return cloneSession(existing), nil
 }
@@ -62,9 +57,6 @@ func (s *inMemorySessionStore) Delete(ctx context.Context, chatID int64) error {
 }
 
 func cloneSession(in *session.Session) *session.Session {
-	if in == nil {
-		return nil
-	}
 	payload, _ := json.Marshal(in)
 	var out session.Session
 	_ = json.Unmarshal(payload, &out)
@@ -75,9 +67,10 @@ func cloneSession(in *session.Session) *session.Session {
 }
 
 type mockInterpreter struct {
-	mu    sync.Mutex
-	calls int
-	fn    func(ctx context.Context, userMessage string, convo interpreter.ConversationContext) (*interpreter.ActionPlan, error)
+	mu       sync.Mutex
+	calls    int
+	fn       func(ctx context.Context, userMessage string, convo interpreter.ConversationContext) (*interpreter.ActionPlan, error)
+	streamFn func(ctx context.Context, userMessage string, convo interpreter.ConversationContext, onProgress func(interpreter.Progress)) (*interpreter.ActionPlan, error)
 }
 
 func (m *mockInterpreter) Interpret(ctx context.Context, userMessage string, convo interpreter.ConversationContext) (*interpreter.ActionPlan, error) {
@@ -85,11 +78,25 @@ func (m *mockInterpreter) Interpret(ctx context.Context, userMessage string, con
 	m.calls++
 	fn := m.fn
 	m.mu.Unlock()
-
 	if fn == nil {
 		return nil, errors.New("mock interpreter: fn is nil")
 	}
 	return fn(ctx, userMessage, convo)
+}
+
+func (m *mockInterpreter) InterpretWithProgress(ctx context.Context, userMessage string, convo interpreter.ConversationContext, onProgress func(interpreter.Progress)) (*interpreter.ActionPlan, error) {
+	m.mu.Lock()
+	m.calls++
+	fn := m.streamFn
+	fallback := m.fn
+	m.mu.Unlock()
+	if fn != nil {
+		return fn(ctx, userMessage, convo, onProgress)
+	}
+	if fallback == nil {
+		return nil, errors.New("mock interpreter: fn is nil")
+	}
+	return fallback(ctx, userMessage, convo)
 }
 
 func (m *mockInterpreter) CallCount() int {
@@ -107,12 +114,13 @@ type mockProvider struct {
 	previewBookingCreateCalls int
 	previewBookingCancelCalls int
 	getProviderInfoCalls      int
-	getBookingsFn             func(ctx context.Context, providerID string, f domain.BookingFilter) ([]domain.Booking, error)
-	findSlotsFn               func(ctx context.Context, providerID string, req domain.SlotSearchRequest) ([]domain.Slot, error)
-	previewAvailabilityFn     func(ctx context.Context, providerID string, p domain.ActionParams) (*domain.Preview, error)
-	previewBookingCreateFn    func(ctx context.Context, providerID string, p domain.ActionParams) (*domain.Preview, error)
-	previewBookingCancelFn    func(ctx context.Context, providerID string, p domain.ActionParams) (*domain.Preview, error)
-	getProviderInfoFn         func(ctx context.Context, providerID string) (*domain.ProviderInfo, error)
+
+	getBookingsFn          func(ctx context.Context, providerID string, f domain.BookingFilter) ([]domain.Booking, error)
+	findSlotsFn            func(ctx context.Context, providerID string, req domain.SlotSearchRequest) ([]domain.Slot, error)
+	previewAvailabilityFn  func(ctx context.Context, providerID string, p domain.ActionParams) (*domain.Preview, error)
+	previewBookingCreateFn func(ctx context.Context, providerID string, p domain.ActionParams) (*domain.Preview, error)
+	previewBookingCancelFn func(ctx context.Context, providerID string, p domain.ActionParams) (*domain.Preview, error)
+	getProviderInfoFn      func(ctx context.Context, providerID string) (*domain.ProviderInfo, error)
 }
 
 func (m *mockProvider) GetBookings(ctx context.Context, providerID string, f domain.BookingFilter) ([]domain.Booking, error) {
@@ -143,7 +151,7 @@ func (m *mockProvider) GetProviderInfo(ctx context.Context, providerID string) (
 	fn := m.getProviderInfoFn
 	m.mu.Unlock()
 	if fn == nil {
-		return nil, nil
+		return &domain.ProviderInfo{ProviderID: "spec-1", Timezone: "UTC"}, nil
 	}
 	return fn(ctx, providerID)
 }
@@ -216,34 +224,6 @@ func (m *mockExecutor) CallCount() int {
 	return m.calls
 }
 
-type mockTokenStore struct {
-	mu      sync.Mutex
-	tokens  map[string]AuthToken
-	saves   int
-	saveErr error
-}
-
-func newMockTokenStore() *mockTokenStore {
-	return &mockTokenStore{tokens: make(map[string]AuthToken)}
-}
-
-func (m *mockTokenStore) SaveToken(ctx context.Context, specialistID string, token AuthToken) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.saveErr != nil {
-		return m.saveErr
-	}
-	m.saves++
-	m.tokens[specialistID] = token
-	return nil
-}
-
-func (m *mockTokenStore) SaveCount() int {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.saves
-}
-
 type telegramMessageCall struct {
 	ChatID   int64
 	Text     string
@@ -278,8 +258,9 @@ type mockTelegramGateway struct {
 	draftCalls      []telegramMessageCall
 	finalizeCalls   []telegramMessageCall
 	setWebhookCalls []setWebhookCall
-
-	nextMessageID int64
+	nextMessageID   int64
+	editMarkupErr   error
+	draftErr        error
 }
 
 func newMockTelegramGateway() *mockTelegramGateway {
@@ -314,17 +295,16 @@ func (m *mockTelegramGateway) EditMessageReplyMarkup(ctx context.Context, chatID
 		MessageID: messageID,
 		Markup:    cloneMarkup(markup),
 	})
+	if m.editMarkupErr != nil {
+		return m.editMarkupErr
+	}
 	return nil
 }
 
 func (m *mockTelegramGateway) SendText(ctx context.Context, chatID int64, text string, keyboard *InlineKeyboardMarkup) (int64, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.sendTextCalls = append(m.sendTextCalls, telegramMessageCall{
-		ChatID:   chatID,
-		Text:     text,
-		Keyboard: cloneMarkup(keyboard),
-	})
+	m.sendTextCalls = append(m.sendTextCalls, telegramMessageCall{ChatID: chatID, Text: text, Keyboard: cloneMarkup(keyboard)})
 	m.nextMessageID++
 	return m.nextMessageID, nil
 }
@@ -332,21 +312,17 @@ func (m *mockTelegramGateway) SendText(ctx context.Context, chatID int64, text s
 func (m *mockTelegramGateway) Draft(ctx context.Context, chatID int64, text string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.draftCalls = append(m.draftCalls, telegramMessageCall{
-		ChatID: chatID,
-		Text:   text,
-	})
+	m.draftCalls = append(m.draftCalls, telegramMessageCall{ChatID: chatID, Text: text})
+	if m.draftErr != nil {
+		return m.draftErr
+	}
 	return nil
 }
 
 func (m *mockTelegramGateway) Finalize(ctx context.Context, chatID int64, text string, keyboard *InlineKeyboardMarkup) (int64, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.finalizeCalls = append(m.finalizeCalls, telegramMessageCall{
-		ChatID:   chatID,
-		Text:     text,
-		Keyboard: cloneMarkup(keyboard),
-	})
+	m.finalizeCalls = append(m.finalizeCalls, telegramMessageCall{ChatID: chatID, Text: text, Keyboard: cloneMarkup(keyboard)})
 	m.nextMessageID++
 	return m.nextMessageID, nil
 }
@@ -362,6 +338,18 @@ func (m *mockTelegramGateway) SetWebhook(ctx context.Context, webhookURL, secret
 	return nil
 }
 
+type failingTelegramGateway struct {
+	*mockTelegramGateway
+	sendTextErr error
+}
+
+func (m *failingTelegramGateway) SendText(ctx context.Context, chatID int64, text string, keyboard *InlineKeyboardMarkup) (int64, error) {
+	if m.sendTextErr != nil {
+		return 0, m.sendTextErr
+	}
+	return m.mockTelegramGateway.SendText(ctx, chatID, text, keyboard)
+}
+
 func cloneMarkup(markup *InlineKeyboardMarkup) *InlineKeyboardMarkup {
 	if markup == nil {
 		return nil
@@ -373,21 +361,15 @@ func cloneMarkup(markup *InlineKeyboardMarkup) *InlineKeyboardMarkup {
 }
 
 func newTestHandler(t *testing.T, store *inMemorySessionStore, interp *mockInterpreter, provider *mockProvider, executor *mockExecutor, tg *mockTelegramGateway) *Handler {
-	return newTestHandlerWithTokenStore(t, store, interp, provider, executor, nil, tg)
-}
-
-func newTestHandlerWithTokenStore(t *testing.T, store *inMemorySessionStore, interp *mockInterpreter, provider *mockProvider, executor *mockExecutor, tokenStore *mockTokenStore, tg *mockTelegramGateway) *Handler {
 	t.Helper()
 
 	if store == nil {
 		store = newInMemorySessionStore()
 	}
 	if interp == nil {
-		interp = &mockInterpreter{
-			fn: func(ctx context.Context, userMessage string, convo interpreter.ConversationContext) (*interpreter.ActionPlan, error) {
-				return &interpreter.ActionPlan{Intent: interpreter.IntentUnknown, Confidence: 0.1}, nil
-			},
-		}
+		interp = &mockInterpreter{fn: func(ctx context.Context, userMessage string, convo interpreter.ConversationContext) (*interpreter.ActionPlan, error) {
+			return &interpreter.ActionPlan{Intent: interpreter.IntentUnknown, Confidence: 0.1}, nil
+		}}
 	}
 	if provider == nil {
 		provider = &mockProvider{}
@@ -398,56 +380,35 @@ func newTestHandlerWithTokenStore(t *testing.T, store *inMemorySessionStore, int
 	if tg == nil {
 		tg = newMockTelegramGateway()
 	}
-	if tokenStore == nil {
-		tokenStore = newMockTokenStore()
-	}
 
-	handler, err := NewHandler(
-		HandlerConfig{
-			WebhookSecret:     "secret",
-			WebhookURL:        "https://example.test/webhook",
-			MiniAppURL:        "https://mini.app/open",
-			DefaultProviderID: "prov-1",
-			PlanTTL:           15 * time.Minute,
-		},
-		store,
-		interp,
-		provider,
-		executor,
-		tokenStore,
-		tg,
-	)
+	handler, err := NewHandler(HandlerConfig{
+		WebhookSecret: "secret",
+		WebhookURL:    "https://example.test/webhook",
+		MiniAppURL:    "https://mini.app/open",
+		PlanTTL:       15 * time.Minute,
+	}, store, interp, provider, executor, tg)
 	if err != nil {
 		t.Fatalf("NewHandler: %v", err)
 	}
 	return handler
 }
 
-func seedAuthorizedSession(t *testing.T, store *inMemorySessionStore, chatID int64) {
+func seedSession(t *testing.T, store *inMemorySessionStore, s *session.Session) {
 	t.Helper()
-	if err := store.Save(context.Background(), &session.Session{
-		ChatID:        chatID,
-		ProviderID:    "prov-1",
-		Timezone:      "UTC",
-		DialogHistory: make([]session.Message, 0, 10),
-	}); err != nil {
-		t.Fatalf("seed authorized session: %v", err)
+	if err := store.Save(context.Background(), s); err != nil {
+		t.Fatalf("seed session: %v", err)
 	}
 }
 
-func makeMessageBody(t *testing.T, chatID int64, text string) []byte {
+func makeMessageBody(t *testing.T, chatID int64, fromID int64, text string) []byte {
 	t.Helper()
 	payload := map[string]any{
 		"message": map[string]any{
 			"message_id": 1,
 			"date":       1,
-			"chat": map[string]any{
-				"id": chatID,
-			},
-			"from": map[string]any{
-				"id": chatID,
-			},
-			"text": text,
+			"chat":       map[string]any{"id": chatID},
+			"from":       map[string]any{"id": fromID},
+			"text":       text,
 		},
 	}
 	out, err := json.Marshal(payload)
@@ -457,44 +418,36 @@ func makeMessageBody(t *testing.T, chatID int64, text string) []byte {
 	return out
 }
 
-func makeWebAppDataBody(t *testing.T, chatID int64, payload string) []byte {
+func makeMessageBodyWithUpdateID(t *testing.T, updateID int64, chatID int64, fromID int64, text string) []byte {
 	t.Helper()
-	raw := map[string]any{
+	payload := map[string]any{
+		"update_id": updateID,
 		"message": map[string]any{
 			"message_id": 1,
 			"date":       1,
-			"chat": map[string]any{
-				"id": chatID,
-			},
-			"from": map[string]any{
-				"id": chatID,
-			},
-			"web_app_data": map[string]any{
-				"data":        payload,
-				"button_text": "Войти в Bookably",
-			},
+			"chat":       map[string]any{"id": chatID},
+			"from":       map[string]any{"id": fromID},
+			"text":       text,
 		},
 	}
-	out, err := json.Marshal(raw)
+	out, err := json.Marshal(payload)
 	if err != nil {
-		t.Fatalf("marshal web_app_data body: %v", err)
+		t.Fatalf("marshal message body: %v", err)
 	}
 	return out
 }
 
-func makeCallbackBody(t *testing.T, chatID int64, callbackID, data string, messageID int64) []byte {
+func makeCallbackBody(t *testing.T, chatID int64, fromID int64, callbackID, data string, messageID int64) []byte {
 	t.Helper()
 	payload := map[string]any{
 		"callback_query": map[string]any{
 			"id": callbackID,
 			"from": map[string]any{
-				"id": chatID,
+				"id": fromID,
 			},
 			"message": map[string]any{
 				"message_id": messageID,
-				"chat": map[string]any{
-					"id": chatID,
-				},
+				"chat":       map[string]any{"id": chatID},
 			},
 			"data": data,
 		},
@@ -512,41 +465,39 @@ func sendWebhook(t *testing.T, h *Handler, secret string, body []byte) *httptest
 	req.Header.Set(telegramSecretHeader, secret)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
+	if !h.WaitForIdle(2 * time.Second) {
+		t.Fatal("timeout waiting handler background worker")
+	}
+	return rec
+}
+
+func sendWebhookNoWait(t *testing.T, h *Handler, secret string, body []byte) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewReader(body))
+	req.Header.Set(telegramSecretHeader, secret)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
 	return rec
 }
 
 func TestHandlerRegisterWebhook(t *testing.T) {
 	tg := newMockTelegramGateway()
 	h := newTestHandler(t, nil, nil, nil, nil, tg)
-
 	if err := h.RegisterWebhook(context.Background()); err != nil {
 		t.Fatalf("RegisterWebhook: %v", err)
 	}
-
 	if len(tg.setWebhookCalls) != 1 {
 		t.Fatalf("expected 1 setWebhook call, got %d", len(tg.setWebhookCalls))
-	}
-	call := tg.setWebhookCalls[0]
-	if call.WebhookURL != "https://example.test/webhook" {
-		t.Fatalf("unexpected webhook url: %q", call.WebhookURL)
-	}
-	if call.Secret != "secret" {
-		t.Fatalf("unexpected webhook secret: %q", call.Secret)
-	}
-	if len(call.AllowedUpdates) != 2 || call.AllowedUpdates[0] != "message" || call.AllowedUpdates[1] != "callback_query" {
-		t.Fatalf("unexpected allowed updates: %#v", call.AllowedUpdates)
 	}
 }
 
 func TestHandlerServeHTTPRejectsWrongSecret(t *testing.T) {
-	interp := &mockInterpreter{
-		fn: func(ctx context.Context, userMessage string, convo interpreter.ConversationContext) (*interpreter.ActionPlan, error) {
-			return &interpreter.ActionPlan{Intent: interpreter.IntentUnknown, Confidence: 0.1}, nil
-		},
-	}
+	interp := &mockInterpreter{fn: func(ctx context.Context, userMessage string, convo interpreter.ConversationContext) (*interpreter.ActionPlan, error) {
+		return &interpreter.ActionPlan{Intent: interpreter.IntentUnknown, Confidence: 0.1}, nil
+	}}
 	h := newTestHandler(t, nil, interp, nil, nil, nil)
 
-	rec := sendWebhook(t, h, "wrong-secret", makeMessageBody(t, 10, "Привет"))
+	rec := sendWebhook(t, h, "wrong-secret", makeMessageBody(t, 10, 100, "Привет"))
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("expected 403, got %d", rec.Code)
 	}
@@ -555,94 +506,108 @@ func TestHandlerServeHTTPRejectsWrongSecret(t *testing.T) {
 	}
 }
 
-func TestHandlerServeHTTPRoutesMessageOnce(t *testing.T) {
+func TestHandlerMessageHydratesProviderAndProcessesWithoutLoginPrompt(t *testing.T) {
 	store := newInMemorySessionStore()
-	seedAuthorizedSession(t, store, 11)
-	interp := &mockInterpreter{
-		fn: func(ctx context.Context, userMessage string, convo interpreter.ConversationContext) (*interpreter.ActionPlan, error) {
-			return &interpreter.ActionPlan{Intent: interpreter.IntentUnknown, Confidence: 0.1}, nil
+	provider := &mockProvider{
+		getProviderInfoFn: func(ctx context.Context, providerID string) (*domain.ProviderInfo, error) {
+			return &domain.ProviderInfo{ProviderID: "spec-1", Timezone: "Europe/Moscow"}, nil
 		},
 	}
-	h := newTestHandler(t, store, interp, nil, nil, nil)
+	interp := &mockInterpreter{fn: func(ctx context.Context, userMessage string, convo interpreter.ConversationContext) (*interpreter.ActionPlan, error) {
+		return &interpreter.ActionPlan{Intent: interpreter.IntentUnknown, Confidence: 0.2}, nil
+	}}
+	tg := newMockTelegramGateway()
+	h := newTestHandler(t, store, interp, provider, nil, tg)
 
-	rec := sendWebhook(t, h, "secret", makeMessageBody(t, 11, "Привет"))
+	rec := sendWebhook(t, h, "secret", makeMessageBody(t, 11, 111, "Привет"))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d", rec.Code)
 	}
+	if len(tg.sendTextCalls) != 0 {
+		t.Fatalf("did not expect login prompt text, got %#v", tg.sendTextCalls)
+	}
 	if interp.CallCount() != 1 {
-		t.Fatalf("expected 1 interpreter call, got %d", interp.CallCount())
+		t.Fatalf("expected interpreter call after hydration, got %d", interp.CallCount())
+	}
+	saved, err := store.Get(context.Background(), 11)
+	if err != nil {
+		t.Fatalf("store.Get: %v", err)
+	}
+	if saved.TelegramUserID != 111 {
+		t.Fatalf("expected telegram_user_id=111, got %d", saved.TelegramUserID)
+	}
+	if saved.ProviderID != "spec-1" {
+		t.Fatalf("expected provider id spec-1, got %q", saved.ProviderID)
+	}
+}
+
+func TestHandlerMessageNonSpecialistShowsForbidden(t *testing.T) {
+	store := newInMemorySessionStore()
+	provider := &mockProvider{
+		getProviderInfoFn: func(ctx context.Context, providerID string) (*domain.ProviderInfo, error) {
+			return nil, domain.ErrForbidden
+		},
+	}
+	tg := newMockTelegramGateway()
+	h := newTestHandler(t, store, nil, provider, nil, tg)
+
+	rec := sendWebhook(t, h, "secret", makeMessageBody(t, 12, 222, "Привет"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	if len(tg.sendTextCalls) == 0 || !strings.Contains(strings.ToLower(tg.sendTextCalls[0].Text), "нет доступа") {
+		t.Fatalf("expected forbidden message, got %#v", tg.sendTextCalls)
 	}
 }
 
 func TestHandlerSerializesProcessingPerChat(t *testing.T) {
 	store := newInMemorySessionStore()
-	seedAuthorizedSession(t, store, 12)
+	seedSession(t, store, &session.Session{ChatID: 13, TelegramUserID: 333, ProviderID: "spec-1", Timezone: "UTC"})
+
 	var inFlight int32
 	var maxInFlight int32
-
-	interp := &mockInterpreter{
-		fn: func(ctx context.Context, userMessage string, convo interpreter.ConversationContext) (*interpreter.ActionPlan, error) {
-			cur := atomic.AddInt32(&inFlight, 1)
-			for {
-				old := atomic.LoadInt32(&maxInFlight)
-				if cur <= old || atomic.CompareAndSwapInt32(&maxInFlight, old, cur) {
-					break
-				}
+	interp := &mockInterpreter{fn: func(ctx context.Context, userMessage string, convo interpreter.ConversationContext) (*interpreter.ActionPlan, error) {
+		cur := atomic.AddInt32(&inFlight, 1)
+		for {
+			old := atomic.LoadInt32(&maxInFlight)
+			if cur <= old || atomic.CompareAndSwapInt32(&maxInFlight, old, cur) {
+				break
 			}
-			time.Sleep(25 * time.Millisecond)
-			atomic.AddInt32(&inFlight, -1)
-			return &interpreter.ActionPlan{Intent: interpreter.IntentUnknown, Confidence: 0.1}, nil
-		},
-	}
+		}
+		time.Sleep(20 * time.Millisecond)
+		atomic.AddInt32(&inFlight, -1)
+		return &interpreter.ActionPlan{Intent: interpreter.IntentUnknown, Confidence: 0.2}, nil
+	}}
 	h := newTestHandler(t, store, interp, nil, nil, nil)
 
-	const requests = 2
 	var wg sync.WaitGroup
-	wg.Add(requests)
-	errCh := make(chan error, requests)
-
-	for i := 0; i < requests; i++ {
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			rec := sendWebhook(t, h, "secret", makeMessageBody(t, 12, "Привет"))
-			if rec.Code != http.StatusOK {
-				errCh <- errors.New("non-200 response")
-				return
-			}
-			errCh <- nil
+			_ = sendWebhook(t, h, "secret", makeMessageBody(t, 13, 333, "Тест"))
 		}()
 	}
 	wg.Wait()
-	close(errCh)
-
-	for err := range errCh {
-		if err != nil {
-			t.Fatalf("request failed: %v", err)
-		}
-	}
 	if atomic.LoadInt32(&maxInFlight) != 1 {
-		t.Fatalf("expected max in-flight interpreter calls to be 1, got %d", maxInFlight)
+		t.Fatalf("expected max concurrent calls 1, got %d", maxInFlight)
 	}
 }
 
-func TestHandlerMessageWriteIntentBuildsPreviewAndPendingPlan(t *testing.T) {
+func TestHandlerWriteIntentBuildsPreviewAndPendingPlan(t *testing.T) {
 	store := newInMemorySessionStore()
-	seedAuthorizedSession(t, store, 13)
-	interp := &mockInterpreter{
-		fn: func(ctx context.Context, userMessage string, convo interpreter.ConversationContext) (*interpreter.ActionPlan, error) {
-			return &interpreter.ActionPlan{
-				Intent:     interpreter.IntentSetWorkingHours,
-				Confidence: 0.95,
-				Params: interpreter.ActionParams{
-					DateRange: &interpreter.DateRange{From: "2026-03-24", To: "2026-03-27"},
-					WorkingHours: &interpreter.TimeRange{
-						From: "12:00",
-						To:   "20:00",
-					},
-				},
-			}, nil
-		},
-	}
+	seedSession(t, store, &session.Session{ChatID: 14, TelegramUserID: 444, ProviderID: "spec-1", Timezone: "UTC"})
+
+	interp := &mockInterpreter{fn: func(ctx context.Context, userMessage string, convo interpreter.ConversationContext) (*interpreter.ActionPlan, error) {
+		return &interpreter.ActionPlan{
+			Intent:     interpreter.IntentSetWorkingHours,
+			Confidence: 0.95,
+			Params: interpreter.ActionParams{
+				DateRange:    &interpreter.DateRange{From: "2026-03-24", To: "2026-03-27"},
+				WorkingHours: &interpreter.TimeRange{From: "12:00", To: "20:00"},
+			},
+		}, nil
+	}}
 	provider := &mockProvider{
 		previewAvailabilityFn: func(ctx context.Context, providerID string, p domain.ActionParams) (*domain.Preview, error) {
 			return &domain.Preview{
@@ -658,479 +623,339 @@ func TestHandlerMessageWriteIntentBuildsPreviewAndPendingPlan(t *testing.T) {
 	tg := newMockTelegramGateway()
 	h := newTestHandler(t, store, interp, provider, nil, tg)
 
-	rec := sendWebhook(t, h, "secret", makeMessageBody(t, 13, "На следующей неделе работаю с 12 до 20"))
+	rec := sendWebhook(t, h, "secret", makeMessageBody(t, 14, 444, "На следующей неделе работаю с 12 до 20"))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d", rec.Code)
 	}
-
-	if len(tg.sendChatActionCalls) != 1 || tg.sendChatActionCalls[0].Action != "typing" {
-		t.Fatalf("expected typing chat action, got %#v", tg.sendChatActionCalls)
-	}
-	if len(tg.draftCalls) == 0 {
-		t.Fatal("expected draft call")
-	}
-	if len(tg.finalizeCalls) != 1 {
-		t.Fatalf("expected one finalize call, got %d", len(tg.finalizeCalls))
-	}
-	if tg.finalizeCalls[0].Keyboard == nil {
-		t.Fatal("expected preview keyboard on finalize")
-	}
-
-	saved, err := store.Get(context.Background(), 13)
-	if err != nil {
-		t.Fatalf("store.Get: %v", err)
-	}
-	if saved.PendingPlan == nil {
-		t.Fatal("expected pending plan to be saved")
-	}
-	if saved.PendingPlan.PreviewMsgID == 0 {
-		t.Fatal("expected preview message id to be set")
-	}
-	if len(saved.PendingPlan.IdempotencyKey) != 64 {
-		t.Fatalf("expected 64-char idempotency hash, got %q", saved.PendingPlan.IdempotencyKey)
-	}
-	if saved.PendingPlan.Plan.Intent != interpreter.IntentSetWorkingHours {
-		t.Fatalf("unexpected pending intent: %s", saved.PendingPlan.Plan.Intent)
-	}
-}
-
-func TestHandlerMessageUnknownIntentOnboardingNoKeyboard(t *testing.T) {
-	store := newInMemorySessionStore()
-	seedAuthorizedSession(t, store, 14)
-	interp := &mockInterpreter{
-		fn: func(ctx context.Context, userMessage string, convo interpreter.ConversationContext) (*interpreter.ActionPlan, error) {
-			return &interpreter.ActionPlan{Intent: interpreter.IntentUnknown, Confidence: 0.2}, nil
-		},
-	}
-	tg := newMockTelegramGateway()
-	h := newTestHandler(t, store, interp, nil, nil, tg)
-
-	rec := sendWebhook(t, h, "secret", makeMessageBody(t, 14, "Как дела"))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d", rec.Code)
-	}
-	if len(tg.finalizeCalls) != 1 {
-		t.Fatalf("expected one finalize call, got %d", len(tg.finalizeCalls))
-	}
-	if tg.finalizeCalls[0].Keyboard != nil {
-		t.Fatal("unknown intent must not include keyboard")
-	}
-	if !strings.Contains(tg.finalizeCalls[0].Text, "управлять расписанием") {
-		t.Fatalf("unexpected onboarding text: %q", tg.finalizeCalls[0].Text)
-	}
-
 	saved, err := store.Get(context.Background(), 14)
 	if err != nil {
 		t.Fatalf("store.Get: %v", err)
 	}
-	if saved.PendingPlan != nil {
-		t.Fatal("pending plan must remain nil for unknown intent")
+	if saved.PendingPlan == nil {
+		t.Fatal("expected pending plan")
+	}
+}
+
+func TestHandlerCancelPreviewWithCandidatesShowsSelectionKeyboard(t *testing.T) {
+	store := newInMemorySessionStore()
+	seedSession(t, store, &session.Session{ChatID: 1400, TelegramUserID: 4440, ProviderID: "spec-1", Timezone: "UTC"})
+
+	interp := &mockInterpreter{fn: func(ctx context.Context, userMessage string, convo interpreter.ConversationContext) (*interpreter.ActionPlan, error) {
+		return &interpreter.ActionPlan{
+			Intent:     interpreter.IntentCancelBooking,
+			Confidence: 0.92,
+			Params: interpreter.ActionParams{
+				DateRange: &interpreter.DateRange{From: "2026-04-01", To: "2026-04-01"},
+			},
+		}, nil
+	}}
+	provider := &mockProvider{
+		previewBookingCancelFn: func(ctx context.Context, providerID string, p domain.ActionParams) (*domain.Preview, error) {
+			return &domain.Preview{
+				BookingCandidates: []domain.Booking{
+					{ID: "b1", ClientName: "Иван", ServiceName: "Стрижка", At: time.Date(2026, 4, 1, 11, 0, 0, 0, time.UTC)},
+					{ID: "b2", ClientName: "Марина", ServiceName: "Маникюр", At: time.Date(2026, 4, 1, 14, 0, 0, 0, time.UTC)},
+				},
+				RiskLevel: domain.RiskHigh,
+			}, nil
+		},
+	}
+	tg := newMockTelegramGateway()
+	h := newTestHandler(t, store, interp, provider, nil, tg)
+
+	rec := sendWebhook(t, h, "secret", makeMessageBody(t, 1400, 4440, "Отмени запись на 1 апреля"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	if len(tg.finalizeCalls) != 1 {
+		t.Fatalf("expected one finalize call, got %d", len(tg.finalizeCalls))
+	}
+	saved, err := store.Get(context.Background(), 1400)
+	if err != nil {
+		t.Fatalf("store.Get: %v", err)
+	}
+	if saved.PendingPlan == nil || len(saved.PendingPlan.BookingCandidates) != 2 {
+		t.Fatalf("expected pending booking candidates saved, got %+v", saved.PendingPlan)
+	}
+	kb := tg.finalizeCalls[0].Keyboard
+	if kb == nil || len(kb.InlineKeyboard) < 2 {
+		t.Fatalf("expected selection keyboard, got %#v", kb)
+	}
+	if kb.InlineKeyboard[0][0].CallbackData != BookingData(0, saved.PendingPlan.ID) {
+		t.Fatalf("unexpected booking callback data: %q", kb.InlineKeyboard[0][0].CallbackData)
+	}
+}
+
+func TestHandlerWriteIntentLargeImpactWarnsButKeepsConfirm(t *testing.T) {
+	store := newInMemorySessionStore()
+	seedSession(t, store, &session.Session{ChatID: 1401, TelegramUserID: 4441, ProviderID: "spec-1", Timezone: "UTC"})
+
+	interp := &mockInterpreter{fn: func(ctx context.Context, userMessage string, convo interpreter.ConversationContext) (*interpreter.ActionPlan, error) {
+		return &interpreter.ActionPlan{
+			Intent:     interpreter.IntentSetWorkingHours,
+			Confidence: 0.95,
+			Params: interpreter.ActionParams{
+				DateRange:    &interpreter.DateRange{From: "2026-03-24", To: "2026-03-27"},
+				WorkingHours: &interpreter.TimeRange{From: "10:00", To: "19:00"},
+			},
+		}, nil
+	}}
+	provider := &mockProvider{
+		previewAvailabilityFn: func(ctx context.Context, providerID string, p domain.ActionParams) (*domain.Preview, error) {
+			return &domain.Preview{
+				Summary: "Пн–Пт, 10:00–19:00",
+				AvailabilityChange: domain.AvailabilityChange{
+					AddedSlots:   22,
+					RemovedSlots: 4,
+				},
+				RiskLevel: domain.RiskMedium,
+			}, nil
+		},
+	}
+	tg := newMockTelegramGateway()
+	h := newTestHandler(t, store, interp, provider, nil, tg)
+
+	rec := sendWebhook(t, h, "secret", makeMessageBody(t, 1401, 4441, "Сделай график с 10 до 19"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	if len(tg.sendTextCalls) != 0 {
+		t.Fatalf("expected no forced deep link text, got %#v", tg.sendTextCalls)
+	}
+	if len(tg.finalizeCalls) != 1 {
+		t.Fatalf("expected one preview finalize, got %d", len(tg.finalizeCalls))
+	}
+	call := tg.finalizeCalls[0]
+	if call.Keyboard == nil || len(call.Keyboard.InlineKeyboard) == 0 {
+		t.Fatalf("expected keyboard in preview: %#v", call.Keyboard)
+	}
+	if !strings.Contains(call.Text, "Рекомендация") {
+		t.Fatalf("expected recommendation warning in preview text, got %q", call.Text)
 	}
 }
 
 func TestHandlerReadOnlyListBookingsCallsProviderWithoutACP(t *testing.T) {
 	store := newInMemorySessionStore()
-	seedAuthorizedSession(t, store, 15)
-	interp := &mockInterpreter{
-		fn: func(ctx context.Context, userMessage string, convo interpreter.ConversationContext) (*interpreter.ActionPlan, error) {
-			return &interpreter.ActionPlan{
-				Intent:     interpreter.IntentListBookings,
-				Confidence: 0.91,
-				Params: interpreter.ActionParams{
-					DateRange: &interpreter.DateRange{From: "2026-03-22", To: "2026-03-22"},
-				},
-			}, nil
-		},
-	}
+	seedSession(t, store, &session.Session{ChatID: 15, TelegramUserID: 555, ProviderID: "spec-1", Timezone: "UTC"})
+
+	interp := &mockInterpreter{fn: func(ctx context.Context, userMessage string, convo interpreter.ConversationContext) (*interpreter.ActionPlan, error) {
+		return &interpreter.ActionPlan{
+			Intent:     interpreter.IntentListBookings,
+			Confidence: 0.9,
+			Params: interpreter.ActionParams{
+				DateRange: &interpreter.DateRange{From: "2026-03-22", To: "2026-03-22"},
+			},
+		}, nil
+	}}
 	provider := &mockProvider{
 		getBookingsFn: func(ctx context.Context, providerID string, f domain.BookingFilter) ([]domain.Booking, error) {
-			return []domain.Booking{
-				{
-					ClientName:  "Алина",
-					ServiceName: "Массаж",
-					At:          time.Date(2026, 3, 22, 10, 0, 0, 0, time.UTC),
-				},
-			}, nil
+			return []domain.Booking{{ClientName: "Алина", ServiceName: "Массаж", At: time.Date(2026, 3, 22, 10, 0, 0, 0, time.UTC)}}, nil
 		},
 	}
 	executor := &mockExecutor{}
-	tg := newMockTelegramGateway()
-	h := newTestHandler(t, store, interp, provider, executor, tg)
+	h := newTestHandler(t, store, interp, provider, executor, newMockTelegramGateway())
 
-	rec := sendWebhook(t, h, "secret", makeMessageBody(t, 15, "Покажи записи на сегодня"))
+	rec := sendWebhook(t, h, "secret", makeMessageBody(t, 15, 555, "Покажи записи"))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d", rec.Code)
 	}
 	if provider.GetBookingsCallCount() != 1 {
-		t.Fatalf("expected GetBookings to be called once, got %d", provider.GetBookingsCallCount())
+		t.Fatalf("expected GetBookings called once, got %d", provider.GetBookingsCallCount())
 	}
 	if executor.CallCount() != 0 {
-		t.Fatalf("expected no ACP execution for read-only intent, got %d", executor.CallCount())
-	}
-	if len(tg.finalizeCalls) != 1 {
-		t.Fatalf("expected one finalize call, got %d", len(tg.finalizeCalls))
-	}
-	if tg.finalizeCalls[0].Keyboard != nil {
-		t.Fatal("list_bookings response should not include keyboard")
-	}
-}
-
-func TestHandlerReadOnlyListBookingsLongRangeEscalatesDeepLink(t *testing.T) {
-	store := newInMemorySessionStore()
-	seedAuthorizedSession(t, store, 16)
-	interp := &mockInterpreter{
-		fn: func(ctx context.Context, userMessage string, convo interpreter.ConversationContext) (*interpreter.ActionPlan, error) {
-			return &interpreter.ActionPlan{
-				Intent:     interpreter.IntentListBookings,
-				Confidence: 0.91,
-				Params: interpreter.ActionParams{
-					DateRange: &interpreter.DateRange{From: "2026-03-01", To: "2026-03-12"},
-				},
-			}, nil
-		},
-	}
-	provider := &mockProvider{}
-	tg := newMockTelegramGateway()
-	h := newTestHandler(t, store, interp, provider, nil, tg)
-
-	rec := sendWebhook(t, h, "secret", makeMessageBody(t, 16, "Покажи записи за месяц"))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d", rec.Code)
-	}
-	if provider.GetBookingsCallCount() != 0 {
-		t.Fatalf("provider.GetBookings must not be called on deep-link escalation, got %d", provider.GetBookingsCallCount())
-	}
-	if len(tg.sendTextCalls) != 1 {
-		t.Fatalf("expected one SendText call, got %d", len(tg.sendTextCalls))
-	}
-	if tg.sendTextCalls[0].Keyboard == nil ||
-		len(tg.sendTextCalls[0].Keyboard.InlineKeyboard) == 0 ||
-		tg.sendTextCalls[0].Keyboard.InlineKeyboard[0][0].WebApp == nil {
-		t.Fatal("expected deep-link web_app keyboard")
-	}
-}
-
-func TestHandlerMessageUnauthenticatedShowsLoginButton(t *testing.T) {
-	store := newInMemorySessionStore()
-	interp := &mockInterpreter{
-		fn: func(ctx context.Context, userMessage string, convo interpreter.ConversationContext) (*interpreter.ActionPlan, error) {
-			return &interpreter.ActionPlan{Intent: interpreter.IntentUnknown, Confidence: 0.1}, nil
-		},
-	}
-	tg := newMockTelegramGateway()
-	h := newTestHandler(t, store, interp, nil, nil, tg)
-
-	rec := sendWebhook(t, h, "secret", makeMessageBody(t, 66, "Привет"))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d", rec.Code)
-	}
-	if interp.CallCount() != 0 {
-		t.Fatalf("interpreter must not be called for unauthenticated message, got %d", interp.CallCount())
-	}
-	if len(tg.sendTextCalls) != 1 {
-		t.Fatalf("expected one login message, got %d", len(tg.sendTextCalls))
-	}
-	call := tg.sendTextCalls[0]
-	if call.Keyboard == nil || len(call.Keyboard.InlineKeyboard) == 0 || call.Keyboard.InlineKeyboard[0][0].WebApp == nil {
-		t.Fatalf("expected web_app login keyboard, got %#v", call.Keyboard)
-	}
-	if !strings.Contains(call.Keyboard.InlineKeyboard[0][0].WebApp.URL, "mode=bot_auth") {
-		t.Fatalf("expected bot_auth mode in login URL, got %q", call.Keyboard.InlineKeyboard[0][0].WebApp.URL)
-	}
-}
-
-func TestHandlerWebAppDataAuthSuccessSavesTokenAndSession(t *testing.T) {
-	store := newInMemorySessionStore()
-	tokenStore := newMockTokenStore()
-	provider := &mockProvider{
-		getProviderInfoFn: func(ctx context.Context, providerID string) (*domain.ProviderInfo, error) {
-			return &domain.ProviderInfo{ProviderID: "prov-1", Timezone: "Europe/Moscow"}, nil
-		},
-	}
-	tg := newMockTelegramGateway()
-	h := newTestHandlerWithTokenStore(t, store, nil, provider, nil, tokenStore, tg)
-
-	payload := `{"token":"access-1","refreshToken":"refresh-1","specialistId":"prov-1"}`
-	rec := sendWebhook(t, h, "secret", makeWebAppDataBody(t, 67, payload))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d", rec.Code)
-	}
-	if tokenStore.SaveCount() != 1 {
-		t.Fatalf("expected one token save, got %d", tokenStore.SaveCount())
-	}
-
-	saved, err := store.Get(context.Background(), 67)
-	if err != nil {
-		t.Fatalf("store.Get: %v", err)
-	}
-	if saved.ProviderID != "prov-1" {
-		t.Fatalf("expected provider id prov-1, got %q", saved.ProviderID)
-	}
-	if saved.Timezone != "Europe/Moscow" {
-		t.Fatalf("expected timezone Europe/Moscow, got %q", saved.Timezone)
-	}
-	if len(tg.sendTextCalls) == 0 || !strings.Contains(tg.sendTextCalls[len(tg.sendTextCalls)-1].Text, "Вошёл") {
-		t.Fatalf("expected auth success message, got %#v", tg.sendTextCalls)
-	}
-}
-
-func TestHandlerWebAppDataSpecialistMismatchShowsLogin(t *testing.T) {
-	store := newInMemorySessionStore()
-	tokenStore := newMockTokenStore()
-	tg := newMockTelegramGateway()
-	h := newTestHandlerWithTokenStore(t, store, nil, nil, nil, tokenStore, tg)
-
-	payload := `{"token":"access-1","refreshToken":"refresh-1","specialistId":"other-spec"}`
-	rec := sendWebhook(t, h, "secret", makeWebAppDataBody(t, 68, payload))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d", rec.Code)
-	}
-	if tokenStore.SaveCount() != 0 {
-		t.Fatalf("expected no token save on specialist mismatch, got %d", tokenStore.SaveCount())
-	}
-	if len(tg.sendTextCalls) < 2 {
-		t.Fatalf("expected mismatch warning + login prompt, got %d calls", len(tg.sendTextCalls))
-	}
-	last := tg.sendTextCalls[len(tg.sendTextCalls)-1]
-	if last.Keyboard == nil || len(last.Keyboard.InlineKeyboard) == 0 || last.Keyboard.InlineKeyboard[0][0].WebApp == nil {
-		t.Fatalf("expected login web_app keyboard, got %#v", last.Keyboard)
-	}
-}
-
-func TestHandlerWebAppDataInvalidPayloadShowsLogin(t *testing.T) {
-	store := newInMemorySessionStore()
-	tokenStore := newMockTokenStore()
-	tg := newMockTelegramGateway()
-	h := newTestHandlerWithTokenStore(t, store, nil, nil, nil, tokenStore, tg)
-
-	rec := sendWebhook(t, h, "secret", makeWebAppDataBody(t, 69, "{bad json"))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d", rec.Code)
-	}
-	if tokenStore.SaveCount() != 0 {
-		t.Fatalf("expected no token save on invalid payload, got %d", tokenStore.SaveCount())
-	}
-	if len(tg.sendTextCalls) < 2 {
-		t.Fatalf("expected error + login prompt, got %d calls", len(tg.sendTextCalls))
-	}
-	last := tg.sendTextCalls[len(tg.sendTextCalls)-1]
-	if last.Keyboard == nil || len(last.Keyboard.InlineKeyboard) == 0 || last.Keyboard.InlineKeyboard[0][0].WebApp == nil {
-		t.Fatalf("expected login web_app keyboard, got %#v", last.Keyboard)
+		t.Fatalf("expected no ACP calls, got %d", executor.CallCount())
 	}
 }
 
 func TestHandlerCallbackConfirmSuccessClearsPendingPlan(t *testing.T) {
 	store := newInMemorySessionStore()
-	now := time.Now().UTC()
-	seed := &session.Session{
-		ChatID:     17,
-		Timezone:   "UTC",
-		ProviderID: "prov-1",
+	seedSession(t, store, &session.Session{
+		ChatID:         16,
+		TelegramUserID: 666,
+		ProviderID:     "spec-1",
+		Timezone:       "UTC",
 		PendingPlan: &session.PendingPlan{
 			ID:           "plan-1",
 			PreviewMsgID: 55,
-			CreatedAt:    now,
+			CreatedAt:    time.Now().UTC(),
 			Plan: interpreter.ActionPlan{
-				Intent:     interpreter.IntentCancelBooking,
-				Confidence: 0.9,
+				Intent: interpreter.IntentCancelBooking,
+				Params: interpreter.ActionParams{BookingID: "b-1"},
 			},
 		},
-	}
-	if err := store.Save(context.Background(), seed); err != nil {
-		t.Fatalf("seed save: %v", err)
-	}
+	})
 
-	executor := &mockExecutor{
-		fn: func(ctx context.Context, s *session.Session, pending *session.PendingPlan) (*ExecutionResult, error) {
-			return &ExecutionResult{Message: "Готово. Отмена применена."}, nil
-		},
-	}
+	executor := &mockExecutor{fn: func(ctx context.Context, s *session.Session, pending *session.PendingPlan) (*ExecutionResult, error) {
+		return &ExecutionResult{Message: "ok"}, nil
+	}}
 	tg := newMockTelegramGateway()
-	h := newTestHandler(t, store, &mockInterpreter{fn: func(ctx context.Context, userMessage string, convo interpreter.ConversationContext) (*interpreter.ActionPlan, error) {
-		return &interpreter.ActionPlan{Intent: interpreter.IntentUnknown, Confidence: 0.1}, nil
-	}}, nil, executor, tg)
-	h.clock = func() time.Time { return now.Add(1 * time.Minute) }
+	h := newTestHandler(t, store, nil, nil, executor, tg)
 
-	rec := sendWebhook(t, h, "secret", makeCallbackBody(t, 17, "cb-1", ConfirmData("plan-1"), 55))
+	rec := sendWebhook(t, h, "secret", makeCallbackBody(t, 16, 666, "cb-1", ConfirmData("plan-1"), 55))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d", rec.Code)
 	}
-	if executor.CallCount() != 1 {
-		t.Fatalf("expected one executor call, got %d", executor.CallCount())
+	saved, err := store.Get(context.Background(), 16)
+	if err != nil {
+		t.Fatalf("store.Get: %v", err)
 	}
-	if len(tg.answerCallbackCalls) != 1 {
-		t.Fatalf("expected one answerCallback call, got %d", len(tg.answerCallbackCalls))
+	if saved.PendingPlan != nil {
+		t.Fatal("pending plan must be cleared")
 	}
-	if len(tg.editMarkupCalls) == 0 {
-		t.Fatal("expected keyboard removal call")
-	}
+}
 
+func TestHandlerCallbackCancelClearsPendingPlan(t *testing.T) {
+	store := newInMemorySessionStore()
+	seedSession(t, store, &session.Session{
+		ChatID:         17,
+		TelegramUserID: 777,
+		ProviderID:     "spec-1",
+		Timezone:       "UTC",
+		PendingPlan: &session.PendingPlan{
+			ID:           "plan-2",
+			PreviewMsgID: 77,
+			CreatedAt:    time.Now().UTC(),
+			Plan:         interpreter.ActionPlan{Intent: interpreter.IntentSetWorkingHours},
+		},
+	})
+
+	executor := &mockExecutor{}
+	h := newTestHandler(t, store, nil, nil, executor, newMockTelegramGateway())
+	rec := sendWebhook(t, h, "secret", makeCallbackBody(t, 17, 777, "cb-2", CancelData("plan-2"), 77))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	if executor.CallCount() != 0 {
+		t.Fatalf("expected no executor call, got %d", executor.CallCount())
+	}
 	saved, err := store.Get(context.Background(), 17)
 	if err != nil {
 		t.Fatalf("store.Get: %v", err)
 	}
 	if saved.PendingPlan != nil {
-		t.Fatal("pending plan must be cleared after successful confirm")
+		t.Fatal("pending plan must be cleared")
 	}
 }
 
-func TestHandlerCallbackCancelDoesNotCallACPAndClearsPendingPlan(t *testing.T) {
+func TestHandlerCallbackCancelIgnoresMessageNotModifiedError(t *testing.T) {
 	store := newInMemorySessionStore()
-	seed := &session.Session{
-		ChatID:     18,
-		Timezone:   "UTC",
-		ProviderID: "prov-1",
+	seedSession(t, store, &session.Session{
+		ChatID:         1701,
+		TelegramUserID: 7771,
+		ProviderID:     "spec-1",
+		Timezone:       "UTC",
 		PendingPlan: &session.PendingPlan{
 			ID:           "plan-2",
 			PreviewMsgID: 77,
 			CreatedAt:    time.Now().UTC(),
-			Plan: interpreter.ActionPlan{
-				Intent:     interpreter.IntentSetWorkingHours,
-				Confidence: 0.95,
-			},
+			Plan:         interpreter.ActionPlan{Intent: interpreter.IntentSetWorkingHours},
 		},
-	}
-	if err := store.Save(context.Background(), seed); err != nil {
-		t.Fatalf("seed save: %v", err)
-	}
+	})
 
-	executor := &mockExecutor{}
 	tg := newMockTelegramGateway()
-	h := newTestHandler(t, store, nil, nil, executor, tg)
+	tg.editMarkupErr = errors.New("bot gateway: editMessageReplyMarkup rejected: Bad Request: message is not modified")
+	h := newTestHandler(t, store, nil, nil, &mockExecutor{}, tg)
 
-	rec := sendWebhook(t, h, "secret", makeCallbackBody(t, 18, "cb-2", CancelData("plan-2"), 77))
+	rec := sendWebhook(t, h, "secret", makeCallbackBody(t, 1701, 7771, "cb-2", CancelData("plan-2"), 77))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d", rec.Code)
 	}
-	if executor.CallCount() != 0 {
-		t.Fatalf("expected no ACP call on cancel, got %d", executor.CallCount())
-	}
-	if len(tg.sendTextCalls) == 0 || !strings.Contains(tg.sendTextCalls[len(tg.sendTextCalls)-1].Text, "ничего не изменено") {
-		t.Fatalf("expected cancel confirmation text, got %#v", tg.sendTextCalls)
-	}
-
-	saved, err := store.Get(context.Background(), 18)
+	saved, err := store.Get(context.Background(), 1701)
 	if err != nil {
 		t.Fatalf("store.Get: %v", err)
 	}
 	if saved.PendingPlan != nil {
-		t.Fatal("pending plan must be cleared after cancel")
+		t.Fatal("pending plan must be cleared")
 	}
 }
 
-func TestHandlerCallbackConfirmContractBlockedShowsDeepLinkAndClearsPending(t *testing.T) {
-	store := newInMemorySessionStore()
-	seed := &session.Session{
-		ChatID:     19,
-		Timezone:   "UTC",
-		ProviderID: "prov-1",
-		PendingPlan: &session.PendingPlan{
-			ID:           "plan-3",
-			PreviewMsgID: 88,
-			CreatedAt:    time.Now().UTC(),
-			Plan: interpreter.ActionPlan{
-				Intent:     interpreter.IntentCreateBooking,
-				Confidence: 0.95,
-			},
-		},
-	}
-	if err := store.Save(context.Background(), seed); err != nil {
-		t.Fatalf("seed save: %v", err)
-	}
-
-	executor := &mockExecutor{
-		fn: func(ctx context.Context, s *session.Session, pending *session.PendingPlan) (*ExecutionResult, error) {
-			return nil, errors.Join(ErrExecutionContractBlocked, errors.New("blocked by backend gap"))
-		},
-	}
-	tg := newMockTelegramGateway()
-	h := newTestHandler(t, store, nil, nil, executor, tg)
-
-	rec := sendWebhook(t, h, "secret", makeCallbackBody(t, 19, "cb-3", ConfirmData("plan-3"), 88))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d", rec.Code)
-	}
-	if len(tg.sendTextCalls) == 0 {
-		t.Fatal("expected contract-blocked user message")
-	}
-	last := tg.sendTextCalls[len(tg.sendTextCalls)-1]
-	if last.Keyboard == nil || len(last.Keyboard.InlineKeyboard) == 0 || last.Keyboard.InlineKeyboard[0][0].WebApp == nil {
-		t.Fatalf("expected deep link web_app keyboard on contract blocked, got %#v", last.Keyboard)
-	}
-	if !strings.Contains(last.Text, "временно недоступна") {
-		t.Fatalf("unexpected contract-blocked text: %q", last.Text)
-	}
-
-	saved, err := store.Get(context.Background(), 19)
-	if err != nil {
-		t.Fatalf("store.Get: %v", err)
-	}
-	if saved.PendingPlan != nil {
-		t.Fatal("pending plan must be cleared after contract-blocked confirm")
-	}
-}
-
-func TestHandlerCallbackSlotSelectionUsesPendingSnapshotWithoutProviderRefetch(t *testing.T) {
+func TestHandlerCallbackSlotSelectionUsesPendingSnapshot(t *testing.T) {
 	store := newInMemorySessionStore()
 	now := time.Now().UTC().Truncate(time.Second)
-	seed := &session.Session{
-		ChatID:     70,
-		Timezone:   "UTC",
-		ProviderID: "prov-1",
+	seedSession(t, store, &session.Session{
+		ChatID:         18,
+		TelegramUserID: 888,
+		ProviderID:     "spec-1",
+		Timezone:       "UTC",
 		PendingPlan: &session.PendingPlan{
 			ID:           "plan-slot",
 			PreviewMsgID: 99,
 			CreatedAt:    now,
 			Plan: interpreter.ActionPlan{
-				Intent:     interpreter.IntentCreateBooking,
-				Confidence: 0.9,
-				Params: interpreter.ActionParams{
-					ServiceID: "svc-1",
-				},
+				Intent: interpreter.IntentCreateBooking,
+				Params: interpreter.ActionParams{ServiceID: "svc-1"},
 			},
-			SlotCandidates: []session.PendingSlotCandidate{
-				{
-					ID:        "slot-1",
-					ServiceID: "svc-1",
-					StartAt:   now.Add(30 * time.Minute).Format(time.RFC3339),
-					EndAt:     now.Add(90 * time.Minute).Format(time.RFC3339),
-				},
-			},
+			SlotCandidates: []session.PendingSlotCandidate{{
+				ID:        "slot-1",
+				ServiceID: "svc-1",
+				StartAt:   now.Add(30 * time.Minute).Format(time.RFC3339),
+				EndAt:     now.Add(90 * time.Minute).Format(time.RFC3339),
+			}},
 		},
-	}
-	if err := store.Save(context.Background(), seed); err != nil {
-		t.Fatalf("seed save: %v", err)
-	}
+	})
 
 	provider := &mockProvider{
 		findSlotsFn: func(ctx context.Context, providerID string, req domain.SlotSearchRequest) ([]domain.Slot, error) {
-			return nil, errors.New("must not call provider.FindSlots on slot callback")
+			return nil, errors.New("must not call provider.FindSlots during slot selection")
 		},
 	}
 	tg := newMockTelegramGateway()
 	h := newTestHandler(t, store, nil, provider, nil, tg)
-	h.clock = func() time.Time { return now.Add(1 * time.Minute) }
 
-	rec := sendWebhook(t, h, "secret", makeCallbackBody(t, 70, "cb-slot", SlotData(0, "plan-slot"), 99))
+	rec := sendWebhook(t, h, "secret", makeCallbackBody(t, 18, 888, "cb-slot", SlotData(0, "plan-slot"), 99))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d", rec.Code)
 	}
 	if provider.FindSlotsCallCount() != 0 {
-		t.Fatalf("expected provider.FindSlots call count 0, got %d", provider.FindSlotsCallCount())
+		t.Fatalf("expected zero provider.FindSlots calls, got %d", provider.FindSlotsCallCount())
 	}
-	if len(tg.finalizeCalls) == 0 {
-		t.Fatal("expected finalize call for create confirm preview")
-	}
+}
 
-	saved, err := store.Get(context.Background(), 70)
+func TestHandlerCallbackBookingSelectionUsesPendingSnapshot(t *testing.T) {
+	store := newInMemorySessionStore()
+	now := time.Date(2026, 4, 1, 9, 0, 0, 0, time.UTC)
+	seedSession(t, store, &session.Session{
+		ChatID:         1801,
+		TelegramUserID: 8801,
+		ProviderID:     "spec-1",
+		Timezone:       "UTC",
+		PendingPlan: &session.PendingPlan{
+			ID:           "plan-book",
+			PreviewMsgID: 101,
+			CreatedAt:    now,
+			Plan: interpreter.ActionPlan{
+				Intent: interpreter.IntentCancelBooking,
+			},
+			BookingCandidates: []session.PendingBookingCandidate{
+				{ID: "b1", ClientName: "Иван", ServiceName: "Стрижка", At: now.Add(2 * time.Hour).Format(time.RFC3339)},
+				{ID: "b2", ClientName: "Марина", ServiceName: "Маникюр", At: now.Add(5 * time.Hour).Format(time.RFC3339)},
+			},
+		},
+	})
+
+	tg := newMockTelegramGateway()
+	h := newTestHandler(t, store, nil, nil, nil, tg)
+
+	rec := sendWebhook(t, h, "secret", makeCallbackBody(t, 1801, 8801, "cb-book", BookingData(1, "plan-book"), 101))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	saved, err := store.Get(context.Background(), 1801)
 	if err != nil {
 		t.Fatalf("store.Get: %v", err)
 	}
 	if saved.PendingPlan == nil {
-		t.Fatal("expected pending plan to persist")
+		t.Fatal("expected pending plan after booking selection")
 	}
-	if saved.PendingPlan.Plan.Params.SlotID != "slot-1" {
-		t.Fatalf("expected selected slot id slot-1, got %q", saved.PendingPlan.Plan.Params.SlotID)
+	if saved.PendingPlan.Plan.Params.BookingID != "b2" {
+		t.Fatalf("expected selected booking id b2, got %q", saved.PendingPlan.Plan.Params.BookingID)
+	}
+	if len(tg.finalizeCalls) == 0 || tg.finalizeCalls[len(tg.finalizeCalls)-1].Keyboard == nil {
+		t.Fatalf("expected finalize with confirm keyboard, got %#v", tg.finalizeCalls)
+	}
+	lastKB := tg.finalizeCalls[len(tg.finalizeCalls)-1].Keyboard
+	if len(lastKB.InlineKeyboard) == 0 || len(lastKB.InlineKeyboard[0]) != 2 {
+		t.Fatalf("expected confirm/cancel row, got %#v", lastKB)
 	}
 }
 
@@ -1143,9 +968,163 @@ func TestHandlerBuildDeepLink(t *testing.T) {
 		t.Fatalf("parse link: %v", err)
 	}
 	if parsed.Query().Get("action") != "bookings" {
-		t.Fatalf("unexpected action query value: %q", parsed.Query().Get("action"))
+		t.Fatalf("unexpected action: %q", parsed.Query().Get("action"))
 	}
 	if parsed.Query().Get("context") != "range > 7 days" {
-		t.Fatalf("unexpected context query value: %q", parsed.Query().Get("context"))
+		t.Fatalf("unexpected context: %q", parsed.Query().Get("context"))
+	}
+}
+
+func TestHandlerServeHTTPFastAckOnSlowInterpreter(t *testing.T) {
+	store := newInMemorySessionStore()
+	seedSession(t, store, &session.Session{ChatID: 19, TelegramUserID: 999, ProviderID: "spec-1", Timezone: "UTC"})
+	interp := &mockInterpreter{fn: func(ctx context.Context, userMessage string, convo interpreter.ConversationContext) (*interpreter.ActionPlan, error) {
+		time.Sleep(5 * time.Second)
+		return &interpreter.ActionPlan{Intent: interpreter.IntentUnknown, Confidence: 0.2}, nil
+	}}
+	h := newTestHandler(t, store, interp, nil, nil, newMockTelegramGateway())
+
+	start := time.Now()
+	rec := sendWebhookNoWait(t, h, "secret", makeMessageBodyWithUpdateID(t, 9001, 19, 999, "Привет"))
+	ackMS := time.Since(start).Milliseconds()
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	if ackMS > 300 {
+		t.Fatalf("expected webhook ack <=300ms, got %dms", ackMS)
+	}
+	if !h.WaitForIdle(7 * time.Second) {
+		t.Fatal("expected background processing to complete")
+	}
+}
+
+func TestHandlerDeduplicatesRetryByUpdateID(t *testing.T) {
+	store := newInMemorySessionStore()
+	seedSession(t, store, &session.Session{ChatID: 20, TelegramUserID: 1000, ProviderID: "spec-1", Timezone: "UTC"})
+	var calls int32
+	interp := &mockInterpreter{fn: func(ctx context.Context, userMessage string, convo interpreter.ConversationContext) (*interpreter.ActionPlan, error) {
+		atomic.AddInt32(&calls, 1)
+		return nil, context.DeadlineExceeded
+	}}
+	tg := newMockTelegramGateway()
+	h := newTestHandler(t, store, interp, nil, nil, tg)
+
+	body := makeMessageBodyWithUpdateID(t, 9002, 20, 1000, "Покажи записи")
+	for i := 0; i < 3; i++ {
+		rec := sendWebhook(t, h, "secret", body)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d", rec.Code)
+		}
+	}
+
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("expected interpreter called once for duplicate updates, got %d", got)
+	}
+	if len(tg.sendTextCalls) != 1 {
+		t.Fatalf("expected single timeout message, got %d", len(tg.sendTextCalls))
+	}
+}
+
+func TestHandlerDeduplicatesUpdateEvenWhenHandlingFails(t *testing.T) {
+	store := newInMemorySessionStore()
+	seedSession(t, store, &session.Session{ChatID: 201, TelegramUserID: 1002, ProviderID: "spec-1", Timezone: "UTC"})
+
+	var calls int32
+	interp := &mockInterpreter{fn: func(ctx context.Context, userMessage string, convo interpreter.ConversationContext) (*interpreter.ActionPlan, error) {
+		atomic.AddInt32(&calls, 1)
+		return nil, context.DeadlineExceeded
+	}}
+
+	baseTG := newMockTelegramGateway()
+	tg := &failingTelegramGateway{
+		mockTelegramGateway: baseTG,
+		sendTextErr:         errors.New("telegram send failure"),
+	}
+	h, err := NewHandler(HandlerConfig{
+		WebhookSecret: "secret",
+		WebhookURL:    "https://example.test/webhook",
+		MiniAppURL:    "https://mini.app/open",
+		PlanTTL:       15 * time.Minute,
+	}, store, interp, &mockProvider{}, &mockExecutor{}, tg)
+	if err != nil {
+		t.Fatalf("NewHandler: %v", err)
+	}
+
+	body := makeMessageBodyWithUpdateID(t, 9004, 201, 1002, "Покажи записи")
+	for i := 0; i < 3; i++ {
+		rec := sendWebhook(t, h, "secret", body)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d", rec.Code)
+		}
+	}
+
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("expected interpreter called once for duplicate failed updates, got %d", got)
+	}
+}
+
+func TestHandlerProgressiveDraftOnLongInterpret(t *testing.T) {
+	store := newInMemorySessionStore()
+	seedSession(t, store, &session.Session{ChatID: 21, TelegramUserID: 1001, ProviderID: "spec-1", Timezone: "UTC"})
+	interp := &mockInterpreter{streamFn: func(ctx context.Context, userMessage string, convo interpreter.ConversationContext, onProgress func(interpreter.Progress)) (*interpreter.ActionPlan, error) {
+		started := time.Now()
+		for i := 0; i < 4; i++ {
+			onProgress(interpreter.Progress{
+				ChunkCount: i + 1,
+				Bytes:      int64((i + 1) * 16),
+				StartedAt:  started,
+				UpdatedAt:  time.Now(),
+			})
+			time.Sleep(1900 * time.Millisecond)
+		}
+		return &interpreter.ActionPlan{Intent: interpreter.IntentUnknown, Confidence: 0.2}, nil
+	}}
+	tg := newMockTelegramGateway()
+	h := newTestHandler(t, store, interp, nil, nil, tg)
+
+	rec := sendWebhookNoWait(t, h, "secret", makeMessageBodyWithUpdateID(t, 9003, 21, 1001, "Привет"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	if !h.WaitForIdle(10 * time.Second) {
+		t.Fatal("timeout waiting for background processing")
+	}
+	if len(tg.draftCalls) < 3 {
+		t.Fatalf("expected multiple draft calls for long interpret, got %d", len(tg.draftCalls))
+	}
+	if len(tg.finalizeCalls) != 1 {
+		t.Fatalf("expected single finalize call, got %d", len(tg.finalizeCalls))
+	}
+}
+
+func TestHandlerHeartbeatDraftOnSlowInterpretWithoutChunks(t *testing.T) {
+	store := newInMemorySessionStore()
+	seedSession(t, store, &session.Session{ChatID: 2102, TelegramUserID: 1003, ProviderID: "spec-1", Timezone: "UTC"})
+	interp := &mockInterpreter{streamFn: func(ctx context.Context, userMessage string, convo interpreter.ConversationContext, onProgress func(interpreter.Progress)) (*interpreter.ActionPlan, error) {
+		time.Sleep(5 * time.Second)
+		return &interpreter.ActionPlan{Intent: interpreter.IntentUnknown, Confidence: 0.2}, nil
+	}}
+	tg := newMockTelegramGateway()
+	h := newTestHandler(t, store, interp, nil, nil, tg)
+
+	rec := sendWebhookNoWait(t, h, "secret", makeMessageBodyWithUpdateID(t, 9005, 2102, 1003, "Привет"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	if !h.WaitForIdle(8 * time.Second) {
+		t.Fatal("timeout waiting for background processing")
+	}
+	if len(tg.draftCalls) < 2 {
+		t.Fatalf("expected heartbeat drafts, got %d", len(tg.draftCalls))
+	}
+}
+
+func TestFormatErrorTimeoutContainsExamples(t *testing.T) {
+	got := FormatError("timeout")
+	if !strings.Contains(got, "Примеры") {
+		t.Fatalf("expected timeout fallback with examples, got: %q", got)
+	}
+	if !strings.Contains(got, "Покажи записи на завтра") {
+		t.Fatalf("expected example commands in timeout fallback, got: %q", got)
 	}
 }

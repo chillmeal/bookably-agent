@@ -23,12 +23,12 @@ type Config struct {
 	ACPAPIKey  string `envconfig:"ACP_API_KEY" required:"true"`
 
 	// Bookably
-	BookablyAPIURL       string `envconfig:"BOOKABLY_API_URL" required:"true"`
-	BookablySpecialistID string `envconfig:"BOOKABLY_SPECIALIST_ID" required:"true"`
+	BookablyAPIURL        string `envconfig:"BOOKABLY_API_URL" required:"true"`
+	BookablyBotServiceKey string `envconfig:"BOOKABLY_BOT_SERVICE_KEY" required:"true"`
 
 	// LLM
-	LLMProvider string `envconfig:"LLM_PROVIDER" required:"true"` // anthropic | openai
-	LLMAPIKey   string `envconfig:"LLM_API_KEY" required:"true"`
+	LLMProvider string `envconfig:"LLM_PROVIDER" required:"true"` // openrouter | stub
+	LLMAPIKey   string `envconfig:"LLM_API_KEY" default:""`
 	LLMModel    string `envconfig:"LLM_MODEL" default:""` // empty = provider default
 
 	// Mini App
@@ -42,6 +42,7 @@ type Config struct {
 	LLMTimeout          time.Duration `envconfig:"LLM_TIMEOUT" default:"15s"`
 	SessionTTL          time.Duration `envconfig:"SESSION_TTL" default:"24h"`
 	PlanTTL             time.Duration `envconfig:"PLAN_TTL" default:"15m"`
+	WorkerTimeout       time.Duration `envconfig:"WORKER_TIMEOUT" default:"90s"`
 	ACPPollInterval     time.Duration `envconfig:"ACP_POLL_INTERVAL" default:"2s"`
 	ACPPollTimeout      time.Duration `envconfig:"ACP_POLL_TIMEOUT" default:"30s"`
 	BookablyHTTPTimeout time.Duration `envconfig:"BOOKABLY_HTTP_TIMEOUT" default:"5s"`
@@ -55,17 +56,16 @@ func Load() (*Config, error) {
 	}
 
 	required := map[string]string{
-		"TG_BOT_TOKEN":           c.TelegramBotToken,
-		"TG_WEBHOOK_URL":         c.TelegramWebhookURL,
-		"TG_WEBHOOK_SECRET":      c.TelegramWebhookSecret,
-		"REDIS_URL":              c.RedisURL,
-		"ACP_BASE_URL":           c.ACPBaseURL,
-		"ACP_API_KEY":            c.ACPAPIKey,
-		"BOOKABLY_API_URL":       c.BookablyAPIURL,
-		"BOOKABLY_SPECIALIST_ID": c.BookablySpecialistID,
-		"LLM_PROVIDER":           c.LLMProvider,
-		"LLM_API_KEY":            c.LLMAPIKey,
-		"MINI_APP_URL":           c.MiniAppURL,
+		"TG_BOT_TOKEN":             c.TelegramBotToken,
+		"TG_WEBHOOK_URL":           c.TelegramWebhookURL,
+		"TG_WEBHOOK_SECRET":        c.TelegramWebhookSecret,
+		"REDIS_URL":                c.RedisURL,
+		"ACP_BASE_URL":             c.ACPBaseURL,
+		"ACP_API_KEY":              c.ACPAPIKey,
+		"BOOKABLY_API_URL":         c.BookablyAPIURL,
+		"BOOKABLY_BOT_SERVICE_KEY": c.BookablyBotServiceKey,
+		"LLM_PROVIDER":             c.LLMProvider,
+		"MINI_APP_URL":             c.MiniAppURL,
 	}
 	for name, value := range required {
 		if strings.TrimSpace(value) == "" {
@@ -74,9 +74,20 @@ func Load() (*Config, error) {
 	}
 
 	switch c.LLMProvider {
-	case "anthropic", "openai":
+	case "openrouter":
+		if strings.TrimSpace(c.LLMAPIKey) == "" {
+			return nil, fmt.Errorf("config: missing required variable LLM_API_KEY for provider %s", c.LLMProvider)
+		}
+		model := strings.TrimSpace(c.LLMModel)
+		if model == "" {
+			c.LLMModel = "openai/gpt-5.4-mini"
+		} else {
+			c.LLMModel = model
+		}
+	case "stub":
+		// LLM_API_KEY intentionally optional for stub mode.
 	default:
-		return nil, fmt.Errorf("config: LLM_PROVIDER must be 'anthropic' or 'openai', got %q", c.LLMProvider)
+		return nil, fmt.Errorf("config: LLM_PROVIDER must be 'openrouter' or 'stub', got %q", c.LLMProvider)
 	}
 
 	return &c, nil

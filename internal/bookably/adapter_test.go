@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
+	"github.com/chillmeal/bookably-agent/internal/actorctx"
 	"github.com/chillmeal/bookably-agent/internal/domain"
 	"github.com/redis/go-redis/v9"
 )
@@ -20,19 +21,20 @@ import (
 func newTestAdapter(t *testing.T, serverURL string, cache redis.Cmdable) *Adapter {
 	t.Helper()
 
-	store := newMemoryTokenStore(map[string]*Token{
-		"spec-1": {AccessToken: "token", RefreshToken: "refresh"},
-	})
-	client, err := NewClient(serverURL, "spec-1", store, http.DefaultClient, 2*time.Second)
+	client, err := NewClient(serverURL, "bot-service-key", http.DefaultClient, 2*time.Second)
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
 
-	adapter, err := NewAdapter(client, "spec-1", cache, 5*time.Minute)
+	adapter, err := NewAdapter(client, cache, 5*time.Minute)
 	if err != nil {
 		t.Fatalf("NewAdapter: %v", err)
 	}
 	return adapter
+}
+
+func testActorContext() context.Context {
+	return actorctx.WithTelegramUserID(context.Background(), 123456789)
 }
 
 func TestGetBookingsPaginationAndMapping(t *testing.T) {
@@ -72,7 +74,7 @@ func TestGetBookingsPaginationAndMapping(t *testing.T) {
 	from := time.Date(2026, 3, 22, 0, 0, 0, 0, time.FixedZone("UTC+3", 3*3600))
 	to := from.Add(24 * time.Hour)
 
-	bookings, err := adapter.GetBookings(context.Background(), "spec-1", domain.BookingFilter{
+	bookings, err := adapter.GetBookings(testActorContext(), "spec-1", domain.BookingFilter{
 		From:      &from,
 		To:        &to,
 		Status:    "upcoming",
@@ -119,7 +121,7 @@ func TestFindSlotsAndNotFound(t *testing.T) {
 	adapter := newTestAdapter(t, server.URL, nil)
 	from := time.Date(2026, 3, 22, 9, 0, 0, 0, time.UTC)
 
-	slots, err := adapter.FindSlots(context.Background(), "spec-1", domain.SlotSearchRequest{
+	slots, err := adapter.FindSlots(testActorContext(), "spec-1", domain.SlotSearchRequest{
 		ServiceID:  "svc",
 		From:       from,
 		To:         from.Add(24 * time.Hour),
@@ -132,7 +134,7 @@ func TestFindSlotsAndNotFound(t *testing.T) {
 		t.Fatalf("expected 2 slots, got %d", len(slots))
 	}
 
-	_, err = adapter.FindSlots(context.Background(), "spec-1", domain.SlotSearchRequest{ServiceID: "missing", From: from, To: from.Add(time.Hour), MaxResults: 2})
+	_, err = adapter.FindSlots(testActorContext(), "spec-1", domain.SlotSearchRequest{ServiceID: "missing", From: from, To: from.Add(time.Hour), MaxResults: 2})
 	if err == nil {
 		t.Fatal("expected not found error")
 	}
@@ -165,7 +167,7 @@ func TestResolveServiceByNameAndCache(t *testing.T) {
 
 	adapter := newTestAdapter(t, server.URL, rdb)
 
-	svc, err := adapter.resolveServiceByName(context.Background(), "spec-1", "масс")
+	svc, err := adapter.resolveServiceByName(testActorContext(), "spec-1", "масс")
 	if err != nil {
 		t.Fatalf("resolve service масс: %v", err)
 	}
@@ -173,7 +175,7 @@ func TestResolveServiceByNameAndCache(t *testing.T) {
 		t.Fatalf("expected s1, got %s", svc.ID)
 	}
 
-	manicure, err := adapter.resolveServiceByName(context.Background(), "spec-1", "маникюр")
+	manicure, err := adapter.resolveServiceByName(testActorContext(), "spec-1", "маникюр")
 	if err != nil {
 		t.Fatalf("resolve service маникюр: %v", err)
 	}
@@ -181,12 +183,12 @@ func TestResolveServiceByNameAndCache(t *testing.T) {
 		t.Fatalf("expected s2, got %s", manicure.ID)
 	}
 
-	_, err = adapter.resolveServiceByName(context.Background(), "spec-1", "процедура")
+	_, err = adapter.resolveServiceByName(testActorContext(), "spec-1", "процедура")
 	if err == nil || !errors.Is(err, domain.ErrConflict) {
 		t.Fatalf("expected ErrConflict for ambiguous service, got %v", err)
 	}
 
-	_, err = adapter.resolveServiceByName(context.Background(), "spec-1", "xyz")
+	_, err = adapter.resolveServiceByName(testActorContext(), "spec-1", "xyz")
 	if err == nil || !errors.Is(err, domain.ErrNotFound) {
 		t.Fatalf("expected ErrNotFound for unknown service, got %v", err)
 	}
@@ -207,15 +209,17 @@ func TestPreviewAvailabilityChange_NoWriteCallsAndConflict(t *testing.T) {
 		}
 
 		switch r.URL.Path {
+		case endpointPublicSpecialistProfile:
+			_, _ = io.WriteString(w, `{"specialist":{"id":"spec-1","timezone":"Europe/Moscow"}}`)
 		case endpointSpecialistSlots:
 			_, _ = io.WriteString(w, `{"slots":[
-				{"id":"sl1","startAt":"2026-03-24T10:00:00Z","endAt":"2026-03-24T11:00:00Z"},
-				{"id":"sl2","startAt":"2026-03-24T11:00:00Z","endAt":"2026-03-24T12:00:00Z"},
-				{"id":"sl3","startAt":"2026-03-24T12:00:00Z","endAt":"2026-03-24T13:00:00Z"}
+				{"id":"sl1","startAt":"2026-03-24T07:00:00Z","endAt":"2026-03-24T08:00:00Z"},
+				{"id":"sl2","startAt":"2026-03-24T08:00:00Z","endAt":"2026-03-24T09:00:00Z"},
+				{"id":"sl3","startAt":"2026-03-24T09:00:00Z","endAt":"2026-03-24T10:00:00Z"}
 			]}`)
 		case endpointSpecialistBookings:
 			_, _ = io.WriteString(w, `{"bookings":[
-				{"id":"b1","publicId":"BK-1","status":"CONFIRMED","client":{"firstName":"Алина","lastName":"Смирнова"},"service":{"title":"Массаж"},"slot":{"id":"x","startAt":"2026-03-24T11:00:00Z","endAt":"2026-03-24T12:00:00Z"}}
+				{"id":"b1","publicId":"BK-1","status":"CONFIRMED","client":{"firstName":"Алина","lastName":"Смирнова"},"service":{"title":"Массаж"},"slot":{"id":"x","startAt":"2026-03-24T08:00:00Z","endAt":"2026-03-24T09:00:00Z"}}
 			]}`)
 		default:
 			w.WriteHeader(http.StatusNotFound)
@@ -224,7 +228,7 @@ func TestPreviewAvailabilityChange_NoWriteCallsAndConflict(t *testing.T) {
 	defer server.Close()
 
 	adapter := newTestAdapter(t, server.URL, nil)
-	preview, err := adapter.PreviewAvailabilityChange(context.Background(), "spec-1", domain.ActionParams{
+	preview, err := adapter.PreviewAvailabilityChange(testActorContext(), "spec-1", domain.ActionParams{
 		DateRange: &domain.DateRange{From: "2026-03-24", To: "2026-03-24"},
 		TimeRange: &domain.TimeRange{From: "11:00", To: "12:00"},
 	})
@@ -271,7 +275,7 @@ func TestPreviewBookingCreate(t *testing.T) {
 	defer server.Close()
 
 	adapter := newTestAdapter(t, server.URL, nil)
-	preview, err := adapter.PreviewBookingCreate(context.Background(), "spec-1", domain.ActionParams{
+	preview, err := adapter.PreviewBookingCreate(testActorContext(), "spec-1", domain.ActionParams{
 		ServiceName: "Массаж",
 		NotBefore:   "2026-03-22T18:00:00",
 	})
@@ -284,22 +288,27 @@ func TestPreviewBookingCreate(t *testing.T) {
 }
 
 func TestPreviewBookingCancelSingleMultipleAndNotFound(t *testing.T) {
+	var queries []url.Values
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != endpointSpecialistBookings {
-			w.WriteHeader(http.StatusNotFound)
-			return
-		}
-		_, _ = io.WriteString(w, `{"bookings":[
+		switch r.URL.Path {
+		case endpointPublicSpecialistProfile:
+			_, _ = io.WriteString(w, `{"specialist":{"id":"spec-1","timezone":"Europe/Moscow"}}`)
+		case endpointSpecialistBookings:
+			queries = append(queries, r.URL.Query())
+			_, _ = io.WriteString(w, `{"bookings":[
 			{"id":"b1","status":"CONFIRMED","client":{"firstName":"Иван","lastName":"Петров"},"service":{"title":"Стрижка"},"slot":{"startAt":"2026-03-27T11:00:00Z","endAt":"2026-03-27T11:30:00Z"}},
 			{"id":"b2","status":"CONFIRMED","client":{"firstName":"Марина"},"service":{"title":"Маникюр"},"slot":{"startAt":"2026-03-28T14:00:00Z","endAt":"2026-03-28T15:00:00Z"}},
 			{"id":"b3","status":"CONFIRMED","client":{"firstName":"Марина"},"service":{"title":"Педикюр"},"slot":{"startAt":"2026-04-01T11:30:00Z","endAt":"2026-04-01T12:30:00Z"}}
 		]}`)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
 	}))
 	defer server.Close()
 
 	adapter := newTestAdapter(t, server.URL, nil)
 
-	one, err := adapter.PreviewBookingCancel(context.Background(), "spec-1", domain.ActionParams{ClientName: "Иван"})
+	one, err := adapter.PreviewBookingCancel(testActorContext(), "spec-1", domain.ActionParams{ClientName: "Иван"})
 	if err != nil {
 		t.Fatalf("PreviewBookingCancel single: %v", err)
 	}
@@ -307,14 +316,68 @@ func TestPreviewBookingCancelSingleMultipleAndNotFound(t *testing.T) {
 		t.Fatalf("expected b1 result, got %+v", one.BookingResult)
 	}
 
-	_, err = adapter.PreviewBookingCancel(context.Background(), "spec-1", domain.ActionParams{ClientName: "Марина"})
-	if err == nil || !errors.Is(err, domain.ErrConflict) {
-		t.Fatalf("expected ErrConflict for multiple matches, got %v", err)
+	multiple, err := adapter.PreviewBookingCancel(testActorContext(), "spec-1", domain.ActionParams{ClientName: "Марина"})
+	if err != nil {
+		t.Fatalf("PreviewBookingCancel multiple: %v", err)
+	}
+	if len(multiple.BookingCandidates) != 2 {
+		t.Fatalf("expected 2 booking candidates, got %+v", multiple.BookingCandidates)
+	}
+	if multiple.BookingCandidates[0].ID != "b2" || multiple.BookingCandidates[1].ID != "b3" {
+		t.Fatalf("unexpected candidate order: %+v", multiple.BookingCandidates)
 	}
 
-	_, err = adapter.PreviewBookingCancel(context.Background(), "spec-1", domain.ActionParams{ClientName: "Кирилл"})
+	_, err = adapter.PreviewBookingCancel(testActorContext(), "spec-1", domain.ActionParams{ClientName: "Кирилл"})
 	if err == nil || !errors.Is(err, domain.ErrNotFound) {
 		t.Fatalf("expected ErrNotFound for unknown client, got %v", err)
+	}
+
+	if len(queries) == 0 {
+		t.Fatal("expected specialist bookings request")
+	}
+	fromRaw := queries[0].Get("from")
+	toRaw := queries[0].Get("to")
+	if fromRaw == "" || toRaw == "" {
+		t.Fatalf("expected bounded cancel window query, got from=%q to=%q", fromRaw, toRaw)
+	}
+	from, err := time.Parse(time.RFC3339, fromRaw)
+	if err != nil {
+		t.Fatalf("parse from: %v", err)
+	}
+	to, err := time.Parse(time.RFC3339, toRaw)
+	if err != nil {
+		t.Fatalf("parse to: %v", err)
+	}
+	if to.Sub(from) > 31*24*time.Hour {
+		t.Fatalf("cancel preview range must be <= 31d, got %s", to.Sub(from))
+	}
+}
+
+func TestPreviewBookingCancelDateFirstFiltersByApproximateTime(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case endpointPublicSpecialistProfile:
+			_, _ = io.WriteString(w, `{"specialist":{"id":"spec-1","timezone":"Europe/Moscow"}}`)
+		case endpointSpecialistBookings:
+			_, _ = io.WriteString(w, `{"bookings":[
+			{"id":"b1","status":"CONFIRMED","client":{"firstName":"Иван"},"service":{"title":"Стрижка"},"slot":{"startAt":"2026-04-01T11:00:00Z","endAt":"2026-04-01T11:30:00Z"}},
+			{"id":"b2","status":"CONFIRMED","client":{"firstName":"Алина"},"service":{"title":"Массаж"},"slot":{"startAt":"2026-04-01T18:00:00Z","endAt":"2026-04-01T19:00:00Z"}}
+		]}`)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	adapter := newTestAdapter(t, server.URL, nil)
+	preview, err := adapter.PreviewBookingCancel(testActorContext(), "spec-1", domain.ActionParams{
+		ApproximateTime: "2026-04-01T11:20:00",
+	})
+	if err != nil {
+		t.Fatalf("PreviewBookingCancel date-first: %v", err)
+	}
+	if preview.BookingResult == nil || preview.BookingResult.ID != "b1" {
+		t.Fatalf("expected booking b1 for time window, got %+v", preview.BookingResult)
 	}
 }
 
@@ -341,7 +404,7 @@ func TestGetBookingsQueryContainsUTCAndPaginationCursor(t *testing.T) {
 	from := time.Date(2026, 3, 22, 12, 0, 0, 0, time.FixedZone("UTC+3", 3*3600))
 	to := from.Add(4 * time.Hour)
 
-	_, err := adapter.GetBookings(context.Background(), "spec-1", domain.BookingFilter{From: &from, To: &to, Status: "upcoming", Limit: 50})
+	_, err := adapter.GetBookings(testActorContext(), "spec-1", domain.BookingFilter{From: &from, To: &to, Status: "upcoming", Limit: 50})
 	if err != nil {
 		t.Fatalf("GetBookings: %v", err)
 	}
@@ -360,6 +423,8 @@ func TestGetBookingsQueryContainsUTCAndPaginationCursor(t *testing.T) {
 func TestPreviewAvailabilityChangeEmptyRange(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
+		case endpointPublicSpecialistProfile:
+			_, _ = io.WriteString(w, `{"specialist":{"id":"spec-1","timezone":"Europe/Moscow"}}`)
 		case endpointSpecialistSlots:
 			_, _ = io.WriteString(w, `{"slots":[]}`)
 		case endpointSpecialistBookings:
@@ -371,7 +436,7 @@ func TestPreviewAvailabilityChangeEmptyRange(t *testing.T) {
 	defer server.Close()
 
 	adapter := newTestAdapter(t, server.URL, nil)
-	preview, err := adapter.PreviewAvailabilityChange(context.Background(), "spec-1", domain.ActionParams{
+	preview, err := adapter.PreviewAvailabilityChange(testActorContext(), "spec-1", domain.ActionParams{
 		DateRange: &domain.DateRange{From: "2026-03-24", To: "2026-03-24"},
 		TimeRange: &domain.TimeRange{From: "10:00", To: "11:00"},
 	})
@@ -381,8 +446,14 @@ func TestPreviewAvailabilityChangeEmptyRange(t *testing.T) {
 	if preview.AvailabilityChange.AddedSlots != 0 || preview.AvailabilityChange.RemovedSlots != 0 || len(preview.Conflicts) != 0 {
 		t.Fatalf("expected zero impact preview, got %+v", preview)
 	}
-	if preview.AvailabilityExec != nil {
-		t.Fatalf("expected nil availability execution payload, got %+v", preview.AvailabilityExec)
+	if preview.AvailabilityExec == nil {
+		t.Fatal("expected availability execution payload for date-level close operation")
+	}
+	if len(preview.AvailabilityExec.Availability) != 1 {
+		t.Fatalf("expected one availability day payload, got %+v", preview.AvailabilityExec.Availability)
+	}
+	if got := preview.AvailabilityExec.Availability[0].Date; got != "2026-03-24" {
+		t.Fatalf("unexpected availability date: %q", got)
 	}
 }
 
@@ -393,7 +464,7 @@ func TestBuildWorkingHoursSlots_InvalidBreakReturnsValidation(t *testing.T) {
 	_, err := buildWorkingHoursSlots(from, to, domain.ActionParams{
 		WorkingHours: &domain.TimeRange{From: "10:00", To: "18:00"},
 		Breaks:       []domain.TimeRange{{From: "08:00", To: "09:00"}},
-	}, time.Hour)
+	}, time.Hour, time.UTC)
 	if err == nil {
 		t.Fatal("expected validation error for break outside working hours")
 	}
@@ -417,7 +488,7 @@ func TestGetProviderInfo_ReturnsMeError(t *testing.T) {
 	defer server.Close()
 
 	adapter := newTestAdapter(t, server.URL, nil)
-	_, err := adapter.GetProviderInfo(context.Background(), "spec-1")
+	_, err := adapter.GetProviderInfo(testActorContext(), "spec-1")
 	if err == nil {
 		t.Fatal("expected error from /me")
 	}
@@ -445,7 +516,7 @@ func TestGetProviderInfo_UsesSpecialistProfileTimezone(t *testing.T) {
 	defer server.Close()
 
 	adapter := newTestAdapter(t, server.URL, nil)
-	info, err := adapter.GetProviderInfo(context.Background(), "spec-1")
+	info, err := adapter.GetProviderInfo(testActorContext(), "spec-1")
 	if err != nil {
 		t.Fatalf("GetProviderInfo: %v", err)
 	}
@@ -473,11 +544,32 @@ func TestGetProviderInfo_EmptyTimezoneReturnsValidation(t *testing.T) {
 	defer server.Close()
 
 	adapter := newTestAdapter(t, server.URL, nil)
-	_, err := adapter.GetProviderInfo(context.Background(), "spec-1")
+	_, err := adapter.GetProviderInfo(testActorContext(), "spec-1")
 	if err == nil {
 		t.Fatal("expected validation error when timezone is empty")
 	}
 	if !errors.Is(err, domain.ErrValidation) {
 		t.Fatalf("expected ErrValidation, got %v", err)
+	}
+}
+
+func TestGetProviderInfo_NonSpecialistReturnsForbidden(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case endpointMe:
+			_, _ = io.WriteString(w, `{"actor":{"role":"CLIENT","specialistId":null}}`)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	adapter := newTestAdapter(t, server.URL, nil)
+	_, err := adapter.GetProviderInfo(testActorContext(), "")
+	if err == nil {
+		t.Fatal("expected forbidden error for non-specialist actor")
+	}
+	if !errors.Is(err, domain.ErrForbidden) {
+		t.Fatalf("expected ErrForbidden, got %v", err)
 	}
 }

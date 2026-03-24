@@ -14,7 +14,7 @@ func TestClientSubmitRunReturnsRunID(t *testing.T) {
 		if r.Method != http.MethodPost || r.URL.Path != "/runs" {
 			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
 		}
-		if got := r.Header.Get("Authorization"); got != "acp-key" {
+		if got := r.Header.Get("Authorization"); got != "Bearer acp-key" {
 			t.Fatalf("authorization header mismatch: %q", got)
 		}
 		_, _ = io.WriteString(w, `{"run_id":"run-123"}`)
