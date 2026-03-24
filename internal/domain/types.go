@@ -64,9 +64,20 @@ type AvailabilityChange struct {
 	RemovedSlots int `json:"removed_slots"`
 }
 
+type AvailabilityRange struct {
+	StartTime string `json:"start_time"`
+	EndTime   string `json:"end_time"`
+}
+
+type AvailabilityDay struct {
+	Date   string              `json:"date"`
+	Ranges []AvailabilityRange `json:"ranges"`
+}
+
 type AvailabilityExecutionPayload struct {
-	CreateSlots   []Slot   `json:"create_slots,omitempty"`
-	DeleteSlotIDs []string `json:"delete_slot_ids,omitempty"`
+	CreateSlots   []Slot            `json:"create_slots,omitempty"`
+	DeleteSlotIDs []string          `json:"delete_slot_ids,omitempty"`
+	Availability  []AvailabilityDay `json:"availability,omitempty"`
 }
 
 type Preview struct {

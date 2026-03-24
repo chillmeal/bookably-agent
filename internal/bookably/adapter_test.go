@@ -446,8 +446,14 @@ func TestPreviewAvailabilityChangeEmptyRange(t *testing.T) {
 	if preview.AvailabilityChange.AddedSlots != 0 || preview.AvailabilityChange.RemovedSlots != 0 || len(preview.Conflicts) != 0 {
 		t.Fatalf("expected zero impact preview, got %+v", preview)
 	}
-	if preview.AvailabilityExec != nil {
-		t.Fatalf("expected nil availability execution payload, got %+v", preview.AvailabilityExec)
+	if preview.AvailabilityExec == nil {
+		t.Fatal("expected availability execution payload for date-level close operation")
+	}
+	if len(preview.AvailabilityExec.Availability) != 1 {
+		t.Fatalf("expected one availability day payload, got %+v", preview.AvailabilityExec.Availability)
+	}
+	if got := preview.AvailabilityExec.Availability[0].Date; got != "2026-03-24" {
+		t.Fatalf("unexpected availability date: %q", got)
 	}
 }
 

@@ -358,11 +358,16 @@ func (a *Adapter) PreviewAvailabilityChange(ctx context.Context, providerID stri
 
 	sort.Slice(createSlots, func(i, j int) bool { return createSlots[i].Start.Before(createSlots[j].Start) })
 	sort.Strings(deleteSlotIDs)
+	availabilityRanges, availabilityErr := buildAvailabilityExecutionRanges(from, to, p, slots, bookings, loc)
+	if availabilityErr != nil {
+		return nil, availabilityErr
+	}
 	var availabilityExec *domain.AvailabilityExecutionPayload
-	if len(createSlots) > 0 || len(deleteSlotIDs) > 0 {
+	if len(createSlots) > 0 || len(deleteSlotIDs) > 0 || len(availabilityRanges) > 0 {
 		availabilityExec = &domain.AvailabilityExecutionPayload{
 			CreateSlots:   createSlots,
 			DeleteSlotIDs: deleteSlotIDs,
+			Availability:  availabilityRanges,
 		}
 	}
 
@@ -924,6 +929,285 @@ func sameDayInLocation(day time.Time, value time.Time, loc *time.Location) bool 
 	d := day.In(loc)
 	v := value.In(loc)
 	return d.Year() == v.Year() && d.Month() == v.Month() && d.Day() == v.Day()
+}
+
+type minuteRange struct {
+	start int
+	end   int
+}
+
+func buildAvailabilityExecutionRanges(
+	from time.Time,
+	to time.Time,
+	p domain.ActionParams,
+	slots []domain.Slot,
+	bookings []domain.Booking,
+	loc *time.Location,
+) ([]domain.AvailabilityDay, error) {
+	if loc == nil {
+		loc = time.UTC
+	}
+
+	selectedDays := selectedDateKeys(from, to, p.Weekdays, loc)
+	if len(selectedDays) == 0 {
+		return nil, nil
+	}
+
+	switch {
+	case p.WorkingHours != nil:
+		return buildWorkingHoursAvailabilityDays(selectedDays, p, loc)
+	case p.BreakSlot != nil || len(p.Breaks) > 0:
+		return buildAdjustedAvailabilityDays(selectedDays, p, slots, bookings, loc, false)
+	default:
+		return buildAdjustedAvailabilityDays(selectedDays, p, slots, bookings, loc, true)
+	}
+}
+
+func selectedDateKeys(from, to time.Time, weekdays []string, loc *time.Location) []time.Time {
+	if loc == nil {
+		loc = time.UTC
+	}
+	start := time.Date(from.In(loc).Year(), from.In(loc).Month(), from.In(loc).Day(), 0, 0, 0, 0, loc)
+	end := time.Date(to.In(loc).Year(), to.In(loc).Month(), to.In(loc).Day(), 0, 0, 0, 0, loc)
+	set := normalizeWeekdaySet(weekdays)
+	out := make([]time.Time, 0)
+	for day := start; !day.After(end); day = day.AddDate(0, 0, 1) {
+		if len(set) > 0 {
+			wd := strings.ToLower(day.Weekday().String()[:3])
+			if _, ok := set[wd]; !ok {
+				continue
+			}
+		}
+		out = append(out, day)
+	}
+	return out
+}
+
+func buildWorkingHoursAvailabilityDays(days []time.Time, p domain.ActionParams, loc *time.Location) ([]domain.AvailabilityDay, error) {
+	startH, startM, err := parseClock(p.WorkingHours.From)
+	if err != nil {
+		return nil, err
+	}
+	endH, endM, err := parseClock(p.WorkingHours.To)
+	if err != nil {
+		return nil, err
+	}
+	workStart := startH*60 + startM
+	workEnd := endH*60 + endM
+	if workEnd <= workStart {
+		return nil, errors.Join(domain.ErrValidation, errors.New("bookably adapter: working_hours.to must be after from"))
+	}
+
+	breakRanges, err := parseBreakMinuteRanges(p)
+	if err != nil {
+		return nil, err
+	}
+	for _, br := range breakRanges {
+		if br.start < workStart || br.end > workEnd {
+			return nil, errors.Join(domain.ErrValidation, errors.New("bookably adapter: break must be within working hours"))
+		}
+	}
+
+	base := []minuteRange{{start: workStart, end: workEnd}}
+	ranges := subtractMinuteRanges(base, breakRanges)
+
+	out := make([]domain.AvailabilityDay, 0, len(days))
+	for _, day := range days {
+		out = append(out, domain.AvailabilityDay{
+			Date:   day.In(loc).Format("2006-01-02"),
+			Ranges: toAvailabilityRanges(ranges),
+		})
+	}
+	return out, nil
+}
+
+func buildAdjustedAvailabilityDays(
+	days []time.Time,
+	p domain.ActionParams,
+	slots []domain.Slot,
+	bookings []domain.Booking,
+	loc *time.Location,
+	isClose bool,
+) ([]domain.AvailabilityDay, error) {
+	baseline := buildBaselineRangesByDate(slots, bookings, loc)
+	out := make([]domain.AvailabilityDay, 0, len(days))
+
+	var cut []minuteRange
+	if isClose {
+		if p.TimeRange == nil || (strings.TrimSpace(p.TimeRange.From) == "" && strings.TrimSpace(p.TimeRange.To) == "") {
+			cut = []minuteRange{{start: 0, end: 24 * 60}}
+		} else {
+			fromH, fromM, err := parseClock(p.TimeRange.From)
+			if err != nil {
+				return nil, err
+			}
+			toH, toM, err := parseClock(p.TimeRange.To)
+			if err != nil {
+				return nil, err
+			}
+			start := fromH*60 + fromM
+			end := toH*60 + toM
+			if end <= start {
+				return nil, errors.Join(domain.ErrValidation, errors.New("bookably adapter: close time_range.to must be after from"))
+			}
+			cut = []minuteRange{{start: start, end: end}}
+		}
+	} else {
+		var err error
+		cut, err = parseBreakMinuteRanges(p)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	for _, day := range days {
+		key := day.In(loc).Format("2006-01-02")
+		base := baseline[key]
+		updated := subtractMinuteRanges(base, cut)
+		out = append(out, domain.AvailabilityDay{
+			Date:   key,
+			Ranges: toAvailabilityRanges(updated),
+		})
+	}
+
+	return out, nil
+}
+
+func parseBreakMinuteRanges(p domain.ActionParams) ([]minuteRange, error) {
+	rawBreaks := make([]domain.TimeRange, 0)
+	if p.BreakSlot != nil {
+		rawBreaks = append(rawBreaks, *p.BreakSlot)
+	}
+	rawBreaks = append(rawBreaks, p.Breaks...)
+
+	out := make([]minuteRange, 0, len(rawBreaks))
+	for _, br := range rawBreaks {
+		fromH, fromM, err := parseClock(br.From)
+		if err != nil {
+			return nil, err
+		}
+		toH, toM, err := parseClock(br.To)
+		if err != nil {
+			return nil, err
+		}
+		start := fromH*60 + fromM
+		end := toH*60 + toM
+		if end <= start {
+			return nil, errors.Join(domain.ErrValidation, errors.New("bookably adapter: break.to must be after break.from"))
+		}
+		out = append(out, minuteRange{start: start, end: end})
+	}
+	return mergeMinuteRanges(out), nil
+}
+
+func buildBaselineRangesByDate(slots []domain.Slot, bookings []domain.Booking, loc *time.Location) map[string][]minuteRange {
+	if loc == nil {
+		loc = time.UTC
+	}
+	out := make(map[string][]minuteRange)
+	appendInterval := func(start, end time.Time) {
+		localStart := start.In(loc)
+		localEnd := end.In(loc)
+		if localEnd.Before(localStart) || localEnd.Equal(localStart) {
+			return
+		}
+		if localStart.Year() != localEnd.Year() || localStart.YearDay() != localEnd.YearDay() {
+			return
+		}
+		key := localStart.Format("2006-01-02")
+		startMin := localStart.Hour()*60 + localStart.Minute()
+		endMin := localEnd.Hour()*60 + localEnd.Minute()
+		if endMin <= startMin {
+			return
+		}
+		out[key] = append(out[key], minuteRange{start: startMin, end: endMin})
+	}
+
+	for _, slot := range slots {
+		appendInterval(slot.Start, slot.End)
+	}
+	for _, booking := range bookings {
+		end := booking.At.Add(time.Duration(booking.DurationMin) * time.Minute)
+		appendInterval(booking.At, end)
+	}
+
+	for key, ranges := range out {
+		out[key] = mergeMinuteRanges(ranges)
+	}
+	return out
+}
+
+func mergeMinuteRanges(input []minuteRange) []minuteRange {
+	if len(input) == 0 {
+		return nil
+	}
+	ranges := make([]minuteRange, 0, len(input))
+	for _, r := range input {
+		if r.end <= r.start {
+			continue
+		}
+		ranges = append(ranges, r)
+	}
+	if len(ranges) == 0 {
+		return nil
+	}
+	sort.Slice(ranges, func(i, j int) bool {
+		if ranges[i].start == ranges[j].start {
+			return ranges[i].end < ranges[j].end
+		}
+		return ranges[i].start < ranges[j].start
+	})
+
+	merged := make([]minuteRange, 0, len(ranges))
+	current := ranges[0]
+	for i := 1; i < len(ranges); i++ {
+		r := ranges[i]
+		if r.start <= current.end {
+			if r.end > current.end {
+				current.end = r.end
+			}
+			continue
+		}
+		merged = append(merged, current)
+		current = r
+	}
+	merged = append(merged, current)
+	return merged
+}
+
+func subtractMinuteRanges(base []minuteRange, cuts []minuteRange) []minuteRange {
+	result := mergeMinuteRanges(base)
+	for _, cut := range mergeMinuteRanges(cuts) {
+		next := make([]minuteRange, 0, len(result))
+		for _, r := range result {
+			if cut.end <= r.start || cut.start >= r.end {
+				next = append(next, r)
+				continue
+			}
+			if cut.start > r.start {
+				next = append(next, minuteRange{start: r.start, end: cut.start})
+			}
+			if cut.end < r.end {
+				next = append(next, minuteRange{start: cut.end, end: r.end})
+			}
+		}
+		result = next
+	}
+	return mergeMinuteRanges(result)
+}
+
+func toAvailabilityRanges(ranges []minuteRange) []domain.AvailabilityRange {
+	if len(ranges) == 0 {
+		return []domain.AvailabilityRange{}
+	}
+	out := make([]domain.AvailabilityRange, 0, len(ranges))
+	for _, r := range mergeMinuteRanges(ranges) {
+		out = append(out, domain.AvailabilityRange{
+			StartTime: fmt.Sprintf("%02d:%02d", r.start/60, r.start%60),
+			EndTime:   fmt.Sprintf("%02d:%02d", r.end/60, r.end%60),
+		})
+	}
+	return out
 }
 
 func findConflicts(bookings []domain.Booking, removed []timeWindow) []domain.Conflict {

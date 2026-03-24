@@ -3,12 +3,12 @@ package bot
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/chillmeal/bookably-agent/internal/acp"
 	"github.com/chillmeal/bookably-agent/internal/domain"
@@ -130,6 +130,14 @@ func TestRuntimeACPExecutorAvailabilityDirectPrimary(t *testing.T) {
 		if got := r.Header.Get("X-Telegram-User-Id"); got != "987654321" {
 			t.Fatalf("X-Telegram-User-Id mismatch: %q", got)
 		}
+		payload, readErr := io.ReadAll(r.Body)
+		if readErr != nil {
+			t.Fatalf("read body: %v", readErr)
+		}
+		body := string(payload)
+		if !strings.Contains(body, "\"availability\"") {
+			t.Fatalf("expected availability payload, got %s", body)
+		}
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer server.Close()
@@ -142,8 +150,6 @@ func TestRuntimeACPExecutorAvailabilityDirectPrimary(t *testing.T) {
 	}
 
 	s := &session.Session{ChatID: 12, ProviderID: "spec-1", TelegramUserID: 987654321, Timezone: "Europe/Moscow"}
-	start := time.Date(2026, 3, 24, 9, 0, 0, 0, time.UTC)
-	end := start.Add(time.Hour)
 	pending := &session.PendingPlan{
 		ID:             "plan-1",
 		IdempotencyKey: "idem-1",
@@ -151,10 +157,14 @@ func TestRuntimeACPExecutorAvailabilityDirectPrimary(t *testing.T) {
 			Intent: interpreter.IntentSetWorkingHours,
 		},
 		Availability: &session.PendingAvailability{
-			Create: []session.PendingAvailabilityCreate{
-				{StartAt: start.Format(time.RFC3339), EndAt: end.Format(time.RFC3339)},
+			Availability: []session.PendingAvailabilityDay{
+				{
+					Date: "2026-03-24",
+					Ranges: []session.PendingAvailabilityRange{
+						{StartTime: "12:00", EndTime: "20:00"},
+					},
+				},
 			},
-			DeleteSlotIDs: []string{"slot-1"},
 		},
 	}
 

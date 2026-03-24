@@ -17,9 +17,20 @@ type CommitDeleteItem struct {
 	SlotID string `json:"slotId"`
 }
 
+type CommitAvailabilityRange struct {
+	StartTime string `json:"startTime"`
+	EndTime   string `json:"endTime"`
+}
+
+type CommitAvailabilityItem struct {
+	Date   string                    `json:"date"`
+	Ranges []CommitAvailabilityRange `json:"ranges"`
+}
+
 type CommitScheduleBody struct {
-	Create []CommitCreateItem `json:"create,omitempty"`
-	Delete []CommitDeleteItem `json:"delete,omitempty"`
+	Create       []CommitCreateItem       `json:"create,omitempty"`
+	Delete       []CommitDeleteItem       `json:"delete,omitempty"`
+	Availability []CommitAvailabilityItem `json:"availability,omitempty"`
 }
 
 func BuildCancelBookingRun(baseURL, botServiceKey string, telegramUserID int64, bookingID, idempotencyKey string, meta RunMetadata) (*ACPRun, error) {

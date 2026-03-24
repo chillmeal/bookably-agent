@@ -52,9 +52,20 @@ type PendingBookingCandidate struct {
 type PendingAvailability struct {
 	Create        []PendingAvailabilityCreate `json:"create,omitempty"`
 	DeleteSlotIDs []string                    `json:"delete_slot_ids,omitempty"`
+	Availability  []PendingAvailabilityDay    `json:"availability,omitempty"`
 }
 
 type PendingAvailabilityCreate struct {
 	StartAt string `json:"start_at"`
 	EndAt   string `json:"end_at"`
+}
+
+type PendingAvailabilityDay struct {
+	Date   string                     `json:"date"`
+	Ranges []PendingAvailabilityRange `json:"ranges,omitempty"`
+}
+
+type PendingAvailabilityRange struct {
+	StartTime string `json:"start_time"`
+	EndTime   string `json:"end_time"`
 }

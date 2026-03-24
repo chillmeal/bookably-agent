@@ -85,6 +85,12 @@ func (i *Interpreter) InterpretWithProgress(ctx context.Context, userMessage str
 	if err != nil {
 		return nil, err
 	}
+	if heuristic := heuristicActionPlan(trimmedUserMessage, tz, time.Now().In(tz)); heuristic != nil {
+		heuristic.RawUserMessage = trimmedUserMessage
+		heuristic.Timezone = tz.String()
+		heuristic.RequiresConfirm = heuristic.Intent.RequiresConfirm()
+		return heuristic, nil
+	}
 
 	systemPrompt, err := loadSystemPrompt(i.promptPath, tz)
 	if err != nil {
@@ -127,6 +133,32 @@ func (i *Interpreter) InterpretWithProgress(ctx context.Context, userMessage str
 	plan.Timezone = tz.String()
 	plan.RequiresConfirm = plan.Intent.RequiresConfirm()
 	return plan, nil
+}
+
+func heuristicActionPlan(message string, tz *time.Location, now time.Time) *ActionPlan {
+	normalized := strings.ToLower(strings.TrimSpace(message))
+	if normalized == "" {
+		return nil
+	}
+
+	if strings.Contains(normalized, "запис") &&
+		(strings.Contains(normalized, "ближай") || strings.Contains(normalized, "что у меня") || strings.Contains(normalized, "какие у меня")) {
+		start := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, tz)
+		end := start.AddDate(0, 0, 6)
+		return &ActionPlan{
+			Intent:          IntentListBookings,
+			Confidence:      0.92,
+			RequiresConfirm: false,
+			Params: ActionParams{
+				DateRange: &DateRange{
+					From: start.Format("2006-01-02"),
+					To:   end.Format("2006-01-02"),
+				},
+				Status: "upcoming",
+			},
+		}
+	}
+	return nil
 }
 
 func loadTimezone(raw string) (*time.Location, error) {

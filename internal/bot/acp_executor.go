@@ -190,6 +190,38 @@ func (e *RuntimeACPExecutor) executeDirectBookably(ctx context.Context, s *sessi
 		endpoint := fmt.Sprintf("%s/api/v1/specialist/bookings/%s/cancel", e.bookablyBaseURL, bookingID)
 		return e.doDirectRequest(ctx, http.MethodPost, endpoint, s.TelegramUserID, pending.IdempotencyKey, nil)
 	case interpreter.IntentSetWorkingHours, interpreter.IntentAddBreak, interpreter.IntentCloseRange:
+		if pending.Availability != nil && len(pending.Availability.Availability) > 0 {
+			availability := make([]acp.CommitAvailabilityItem, 0, len(pending.Availability.Availability))
+			for _, day := range pending.Availability.Availability {
+				date := strings.TrimSpace(day.Date)
+				if date == "" {
+					continue
+				}
+				item := acp.CommitAvailabilityItem{
+					Date:   date,
+					Ranges: make([]acp.CommitAvailabilityRange, 0, len(day.Ranges)),
+				}
+				for _, r := range day.Ranges {
+					startTime := strings.TrimSpace(r.StartTime)
+					endTime := strings.TrimSpace(r.EndTime)
+					if startTime == "" || endTime == "" {
+						continue
+					}
+					item.Ranges = append(item.Ranges, acp.CommitAvailabilityRange{
+						StartTime: startTime,
+						EndTime:   endTime,
+					})
+				}
+				availability = append(availability, item)
+			}
+			if len(availability) == 0 {
+				return errors.Join(domain.ErrValidation, errors.New("bot acp executor: availability payload is empty"))
+			}
+			body := acp.CommitScheduleBody{Availability: availability}
+			endpoint := fmt.Sprintf("%s/api/v1/specialist/schedule/commit", e.bookablyBaseURL)
+			return e.doDirectRequest(ctx, http.MethodPost, endpoint, s.TelegramUserID, pending.IdempotencyKey+":commit", body)
+		}
+
 		create, deleteIDs, err := buildAvailabilityCommitPayload(pending, s.Timezone)
 		if err != nil {
 			return err

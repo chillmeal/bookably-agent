@@ -150,6 +150,7 @@ func toPendingAvailability(exec *domain.AvailabilityExecutionPayload) *session.P
 	out := &session.PendingAvailability{
 		Create:        make([]session.PendingAvailabilityCreate, 0, len(exec.CreateSlots)),
 		DeleteSlotIDs: make([]string, 0, len(exec.DeleteSlotIDs)),
+		Availability:  make([]session.PendingAvailabilityDay, 0, len(exec.Availability)),
 	}
 
 	for _, slot := range exec.CreateSlots {
@@ -170,7 +171,30 @@ func toPendingAvailability(exec *domain.AvailabilityExecutionPayload) *session.P
 		out.DeleteSlotIDs = append(out.DeleteSlotIDs, slotID)
 	}
 
-	if len(out.Create) == 0 && len(out.DeleteSlotIDs) == 0 {
+	for _, day := range exec.Availability {
+		date := strings.TrimSpace(day.Date)
+		if date == "" {
+			continue
+		}
+		pendingDay := session.PendingAvailabilityDay{
+			Date:   date,
+			Ranges: make([]session.PendingAvailabilityRange, 0, len(day.Ranges)),
+		}
+		for _, r := range day.Ranges {
+			startTime := strings.TrimSpace(r.StartTime)
+			endTime := strings.TrimSpace(r.EndTime)
+			if startTime == "" || endTime == "" {
+				continue
+			}
+			pendingDay.Ranges = append(pendingDay.Ranges, session.PendingAvailabilityRange{
+				StartTime: startTime,
+				EndTime:   endTime,
+			})
+		}
+		out.Availability = append(out.Availability, pendingDay)
+	}
+
+	if len(out.Create) == 0 && len(out.DeleteSlotIDs) == 0 && len(out.Availability) == 0 {
 		return nil
 	}
 	return out
