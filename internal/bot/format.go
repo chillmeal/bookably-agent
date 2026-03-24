@@ -47,85 +47,105 @@ func escapeV2(in string) string {
 }
 
 func FormatAvailabilityPreview(preview domain.Preview) string {
-	understood := strings.TrimSpace(preview.Summary)
-	if understood == "" {
-		understood = "Ок, меняем расписание по интервалам."
-	}
-	willDo := "Я ничего не применяю сразу, сначала показываю изменения и жду подтверждение."
-	var action strings.Builder
-	action.WriteString(fmt.Sprintf("• Добавится: %s\n", boldText(fmt.Sprintf("%d", preview.AvailabilityChange.AddedSlots))))
-	action.WriteString(fmt.Sprintf("• Удалится: %s", boldText(fmt.Sprintf("%d", preview.AvailabilityChange.RemovedSlots))))
+	var b strings.Builder
+	b.WriteString("Ок, подготовил изменения по расписанию.\n\n")
+	b.WriteString("• Добавится: ")
+	b.WriteString(boldText(fmt.Sprintf("%d", preview.AvailabilityChange.AddedSlots)))
+	b.WriteString("\n")
+	b.WriteString("• Удалится: ")
+	b.WriteString(boldText(fmt.Sprintf("%d", preview.AvailabilityChange.RemovedSlots)))
+
 	if len(preview.Conflicts) > 0 {
-		action.WriteString("\n\n⚠️ Конфликты:")
+		b.WriteString("\n\n⚠️ Есть пересечения с записями:\n")
 		for _, c := range preview.Conflicts {
-			line := fmt.Sprintf("\n• %s — %s в %s",
-				fallbackValue(c.ClientName, "клиент"),
-				fallbackValue(c.ServiceName, "услуга"),
-				c.At.Local().Format("02.01 15:04"),
-			)
-			action.WriteString(line)
+			b.WriteString("• ")
+			b.WriteString(boldText(fallbackValue(c.ClientName, "Клиент")))
+			b.WriteString(" — ")
+			b.WriteString(escapeV2(fallbackValue(c.ServiceName, "услуга")))
+			b.WriteString(", ")
+			b.WriteString(boldText(humanDateTime(c.At, time.UTC)))
+			b.WriteString("\n")
 		}
 	}
-	next := "Если всё верно, жми ✅ Применить. Если нужно скорректировать, жми ❌ Отменить."
-	return buildStructuredResponse(understood, willDo, action.String(), next)
+
+	b.WriteString("\nЕсли всё верно, жми ✅ Применить. Если нужно изменить параметры, жми ❌ Отменить.")
+	return renderBody(strings.TrimSpace(b.String()))
 }
 
 func FormatBookingListPreview(bookings []domain.Booking, tz *time.Location) string {
 	if len(bookings) == 0 {
-		return buildStructuredResponse(
-			"Запрос на список записей.",
-			"Проверил календарь на выбранный период.",
-			"Записей в этом диапазоне нет.",
-			"Можешь запросить другой период, например: «покажи записи на завтра».",
-		)
+		return renderBody("На выбранный период записей нет.\nПопробуй уточнить дату или диапазон.")
 	}
-
-	sorted := make([]domain.Booking, len(bookings))
-	copy(sorted, bookings)
-	sort.Slice(sorted, func(i, j int) bool { return sorted[i].At.Before(sorted[j].At) })
 
 	loc := tz
 	if loc == nil {
 		loc = time.UTC
 	}
 
-	var action strings.Builder
-	for _, booking := range sorted {
-		at := booking.At.In(loc).Format("15:04")
-		line := fmt.Sprintf("%s — %s · %s", at, fallbackValue(booking.ClientName, "Клиент"), fallbackValue(booking.ServiceName, "Услуга"))
-		action.WriteString(line)
-		action.WriteString("\n")
-	}
+	sorted := make([]domain.Booking, len(bookings))
+	copy(sorted, bookings)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].At.Before(sorted[j].At) })
 
-	return buildStructuredResponse(
-		"Понял, нужен список записей.",
-		"Собрал и отсортировал записи по времени.",
-		strings.TrimSpace(action.String()),
-		"Можешь уточнить период: например «на пятницу» или «на эту неделю».",
-	)
+	var b strings.Builder
+	b.WriteString("Вот что нашёл:\n")
+	for _, booking := range sorted {
+		b.WriteString("• ")
+		b.WriteString(boldText(humanDateTime(booking.At, loc)))
+		b.WriteString(" — ")
+		b.WriteString(boldText(fallbackValue(booking.ClientName, "Клиент")))
+		b.WriteString(" · ")
+		b.WriteString(escapeV2(fallbackValue(booking.ServiceName, "Услуга")))
+		b.WriteString("\n")
+	}
+	return renderBody(strings.TrimSpace(b.String()))
 }
 
 func FormatCancelPreview(preview domain.Preview) string {
 	if preview.BookingResult == nil {
-		return buildStructuredResponse(
-			"Запрос на отмену записи.",
-			"Проверил совпадения по параметрам.",
-			"Не удалось однозначно определить запись для отмены.",
-			"Уточни клиента и время записи.",
-		)
+		return renderBody("Не получилось однозначно определить запись для отмены.\nУточни клиента или время.")
 	}
 
 	bk := preview.BookingResult
-	return buildStructuredResponse(
-		"Ок, готовлю отмену записи.",
-		"Нашёл нужную запись и проверил детали.",
-		fmt.Sprintf("• Клиент: %s\n• Услуга: %s\n• Время: %s\n⚠️ Это действие необратимо.",
-			boldText(fallbackValue(bk.ClientName, "Клиент")),
-			boldText(fallbackValue(bk.ServiceName, "Услуга")),
-			boldText(bk.At.Local().Format("02.01 15:04")),
-		),
-		"Подтверди отмену кнопкой ✅ Применить или отмени действие кнопкой ❌ Отменить.",
-	)
+	var b strings.Builder
+	b.WriteString("Нашёл запись для отмены:\n")
+	b.WriteString("• Клиент: ")
+	b.WriteString(boldText(fallbackValue(bk.ClientName, "Клиент")))
+	b.WriteString("\n")
+	b.WriteString("• Услуга: ")
+	b.WriteString(boldText(fallbackValue(bk.ServiceName, "Услуга")))
+	b.WriteString("\n")
+	b.WriteString("• Время: ")
+	b.WriteString(boldText(humanDateTime(bk.At, time.UTC)))
+	b.WriteString("\n\n⚠️ Отмена необратима.")
+	return renderBody(strings.TrimSpace(b.String()))
+}
+
+func FormatCancelCandidates(candidates []domain.Booking, tz *time.Location) string {
+	if len(candidates) == 0 {
+		return renderBody("По указанным данным записи не нашёл.\nПопробуй уточнить клиента или время.")
+	}
+	loc := tz
+	if loc == nil {
+		loc = time.UTC
+	}
+	max := len(candidates)
+	if max > 3 {
+		max = 3
+	}
+
+	var b strings.Builder
+	b.WriteString("Нашёл несколько подходящих записей. Выбери нужную кнопкой ниже:\n")
+	for i := 0; i < max; i++ {
+		item := candidates[i]
+		b.WriteString("• ")
+		b.WriteString(boldText(fallbackValue(item.ClientName, "Клиент")))
+		b.WriteString(" — ")
+		b.WriteString(escapeV2(fallbackValue(item.ServiceName, "Услуга")))
+		b.WriteString(", ")
+		b.WriteString(boldText(humanDateTime(item.At, loc)))
+		b.WriteString("\n")
+	}
+	return renderBody(strings.TrimSpace(b.String()))
 }
 
 func FormatCreatePreview(preview domain.Preview, tz *time.Location) string {
@@ -134,34 +154,26 @@ func FormatCreatePreview(preview domain.Preview, tz *time.Location) string {
 		loc = time.UTC
 	}
 	if len(preview.ProposedSlots) == 0 {
-		return buildStructuredResponse(
-			"Запрос на создание записи.",
-			"Проверил доступные интервалы у специалиста.",
-			"Свободных интервалов в текущем окне не найдено.",
-			"Попробуй расширить диапазон времени или дату.",
-		)
+		return renderBody("Свободных окон в текущем диапазоне нет.\nПопробуй другую дату или более широкий диапазон.")
 	}
 
 	max := len(preview.ProposedSlots)
 	if max > 2 {
 		max = 2
 	}
-
-	var action strings.Builder
+	var b strings.Builder
+	b.WriteString("Нашёл ближайшие свободные окна:\n")
 	for i := 0; i < max; i++ {
 		slot := preview.ProposedSlots[i]
-		action.WriteString(slot.Start.In(loc).Format("15:04"))
+		b.WriteString("• ")
+		b.WriteString(boldText(humanDateTime(slot.Start, loc)))
 		if i == 0 {
-			action.WriteString(" — основной вариант")
+			b.WriteString(" (основной вариант)")
 		}
-		action.WriteString("\n")
+		b.WriteString("\n")
 	}
-	return buildStructuredResponse(
-		"Понял, создаём запись.",
-		"Нашёл ближайшие свободные интервалы.",
-		strings.TrimSpace(action.String()),
-		"Выбери вариант кнопкой ниже, потом подтверди создание.",
-	)
+	b.WriteString("\nВыбери вариант кнопкой ниже, затем подтверди создание записи.")
+	return renderBody(strings.TrimSpace(b.String()))
 }
 
 func FormatFindSlotResult(slots []domain.Slot, tz *time.Location) string {
@@ -170,105 +182,52 @@ func FormatFindSlotResult(slots []domain.Slot, tz *time.Location) string {
 		loc = time.UTC
 	}
 	if len(slots) == 0 {
-		return buildStructuredResponse(
-			"Запрос на поиск ближайшего окна.",
-			"Проверил доступность по выбранной услуге.",
-			"Свободных интервалов не найдено.",
-			"Попробуй другую дату или более широкий диапазон.",
-		)
+		return renderBody("Пока не вижу свободных окон по этим условиям.\nПопробуй расширить диапазон времени.")
 	}
 
 	max := len(slots)
 	if max > 2 {
 		max = 2
 	}
-
-	var action strings.Builder
+	var b strings.Builder
+	b.WriteString("Ближайшие варианты:\n")
 	for i := 0; i < max; i++ {
 		slot := slots[i]
-		action.WriteString(fmt.Sprintf("%d. %s\n", i+1, slot.Start.In(loc).Format("02.01 15:04")))
+		b.WriteString(fmt.Sprintf("• %d) %s\n", i+1, boldText(humanDateTime(slot.Start, loc))))
 	}
-	return buildStructuredResponse(
-		"Понял, ищем ближайшее окно.",
-		"Подобрал ближайшие доступные интервалы.",
-		strings.TrimSpace(action.String()),
-		"Выбери подходящий вариант кнопкой ниже.",
-	)
+	b.WriteString("\nВыбери подходящий вариант кнопкой ниже.")
+	return renderBody(strings.TrimSpace(b.String()))
 }
 
 func FormatClarification(q string) string {
-	if strings.TrimSpace(q) == "" {
-		q = "Уточни, пожалуйста, запрос."
+	q = strings.TrimSpace(q)
+	if q == "" {
+		q = "Уточни, пожалуйста, детали запроса."
 	}
-	return buildStructuredResponse(
-		"Нужна одна короткая деталь.",
-		"Сразу продолжу после твоего ответа.",
-		strings.TrimSpace(q),
-		"Ответь одним коротким сообщением.",
-	)
+	return renderBody("Нужна одна деталь, чтобы продолжить:\n• " + q)
 }
 
 func FormatError(errType string) string {
 	switch strings.ToLower(strings.TrimSpace(errType)) {
 	case "not_found":
-		return buildStructuredResponse(
-			"Не удалось найти данные по запросу.",
-			"Проверил доступные записи и интервалы.",
-			"Совпадений не найдено.",
-			"Уточни клиента, услугу или дату и повтори запрос.",
-		)
+		return renderBody("Не нашёл подходящих данных по этому запросу.\nУточни клиента, услугу или дату.")
 	case "conflict":
-		return buildStructuredResponse(
-			"Найдён конфликт данных.",
-			"Остановил выполнение до ручного подтверждения.",
-			"Изменения могут затронуть уже занятые интервалы.",
-			"Проверь детали в превью и повтори действие.",
-		)
+		return renderBody("Нашёл несколько совпадений, и без выбора можно ошибиться.\nУточни клиента или время записи.")
 	case "timeout":
-		return buildStructuredResponse(
-			"Похоже, сервис ответил слишком медленно.",
-			"Остановил попытку без изменений.",
-			"Команда пока не выполнена.",
-			"Примеры: «Покажи записи на завтра», «Закрой пятницу», «Отмени запись Ивана в четверг».",
-		)
+		return renderBody("Сервис ответил слишком медленно, поэтому остановил попытку без изменений.\nПримеры: «Покажи записи на завтра», «Закрой пятницу», «Отмени запись Ивана в четверг».")
 	case "forbidden":
-		return buildStructuredResponse(
-			"Недостаточно прав для выполнения операции.",
-			"Проверил доступы текущего аккаунта.",
-			"Операция разрешена только активному специалисту.",
-			"Проверь роль аккаунта и попробуй снова.",
-		)
+		return renderBody("Недостаточно прав для этой операции.\nПроверь, что аккаунт активирован как специалист.")
 	case "upstream":
-		return buildStructuredResponse(
-			"Внешний сервис сейчас отвечает нестабильно.",
-			"Чтобы не сделать дубликаты, остановил выполнение.",
-			"Изменения не применены.",
-			"Подожди 10–20 секунд и повтори команду.",
-		)
+		return renderBody("Внешний сервис сейчас отвечает нестабильно.\nПодожди 10–20 секунд и повтори команду.")
 	case "validation":
-		return buildStructuredResponse(
-			"В запросе не хватает обязательных данных.",
-			"Проверил параметры перед выполнением.",
-			"Команда отклонена до уточнения.",
-			"Уточни дату, время или услугу и повтори запрос.",
-		)
+		return renderBody("Не хватает обязательных деталей для выполнения команды.\nУточни дату, время или услугу.")
 	default:
-		return buildStructuredResponse(
-			"Не удалось обработать запрос.",
-			"Система не смогла безопасно продолжить выполнение.",
-			"Изменения не применены.",
-			"Повтори попытку или уточни формулировку команды.",
-		)
+		return renderBody("Не удалось обработать запрос.\nПовтори попытку или уточни формулировку.")
 	}
 }
 
 func FormatUnknownIntent() string {
-	return buildStructuredResponse(
-		"Похоже, команда вне моего сценария.",
-		"Я помогаю только с расписанием и записями.",
-		"Примеры:\n• Покажи записи на завтра\n• Закрой пятницу\n• Запиши Алину на массаж",
-		"Напиши команду в похожем формате, и сразу продолжим.",
-	)
+	return renderBody("Пока не понял команду.\nПопробуй так:\n• Покажи записи на завтра\n• Закрой пятницу\n• Запиши Алину на массаж")
 }
 
 func fallbackValue(value, fallback string) string {
@@ -279,41 +238,38 @@ func fallbackValue(value, fallback string) string {
 	return trimmed
 }
 
-func buildStructuredResponse(understood, willDo, action, next string) string {
-	sections := []struct {
-		title string
-		body  string
-	}{
-		{title: "Понял", body: understood},
-		{title: "Что сделаю", body: willDo},
-		{title: "Действие", body: action},
-		{title: "Что дальше", body: next},
-	}
-
-	var b strings.Builder
-	for _, section := range sections {
-		body := strings.TrimSpace(section.body)
-		if body == "" {
-			continue
-		}
-		if b.Len() > 0 {
-			b.WriteString("\n\n")
-		}
-		b.WriteString("*")
-		b.WriteString(section.title)
-		b.WriteString(":*\n")
-		b.WriteString(renderBody(body))
-	}
-	return strings.TrimSpace(b.String())
+func renderBody(body string) string {
+	escaped := escapeV2(body)
+	escaped = strings.ReplaceAll(escaped, boldOpenMark, "*")
+	escaped = strings.ReplaceAll(escaped, boldCloseMark, "*")
+	return escaped
 }
 
 func boldText(value string) string {
 	return boldOpenMark + strings.TrimSpace(value) + boldCloseMark
 }
 
-func renderBody(body string) string {
-	escaped := escapeV2(body)
-	escaped = strings.ReplaceAll(escaped, boldOpenMark, "*")
-	escaped = strings.ReplaceAll(escaped, boldCloseMark, "*")
-	return escaped
+func humanDateTime(ts time.Time, tz *time.Location) string {
+	loc := tz
+	if loc == nil {
+		loc = time.UTC
+	}
+	local := ts.In(loc)
+	months := []string{
+		"",
+		"января",
+		"февраля",
+		"марта",
+		"апреля",
+		"мая",
+		"июня",
+		"июля",
+		"августа",
+		"сентября",
+		"октября",
+		"ноября",
+		"декабря",
+	}
+	month := months[int(local.Month())]
+	return fmt.Sprintf("%d %s, %s", local.Day(), month, local.Format("15:04"))
 }

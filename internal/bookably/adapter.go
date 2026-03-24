@@ -15,12 +15,12 @@ import (
 )
 
 const (
-	defaultBookingsLimit    = 50
-	defaultSlotsWindow      = 7 * 24 * time.Hour
-	defaultPrefsCacheTTL    = 5 * time.Minute
-	defaultSlotDuration     = time.Hour
-	dayEndDuration          = 24*time.Hour - time.Nanosecond
-	defaultBookingsLookback = 365 * 24 * time.Hour
+	defaultBookingsLimit = 50
+	defaultSlotsWindow   = 7 * 24 * time.Hour
+	defaultPrefsCacheTTL = 5 * time.Minute
+	defaultSlotDuration  = time.Hour
+	dayEndDuration       = 24*time.Hour - time.Nanosecond
+	maxCancelSearchRange = 31 * 24 * time.Hour
 )
 
 var errNoBreakWindows = errors.New("bookably adapter: no breaks provided")
@@ -413,8 +413,13 @@ func (a *Adapter) PreviewBookingCreate(ctx context.Context, providerID string, p
 }
 
 func (a *Adapter) PreviewBookingCancel(ctx context.Context, providerID string, p domain.ActionParams) (*domain.Preview, error) {
+	filter, exactTimeRef, hasExactTime, err := buildCancelFilter(p, time.Now().UTC())
+	if err != nil {
+		return nil, err
+	}
+
 	if strings.TrimSpace(p.BookingID) != "" {
-		bookings, err := a.GetBookings(ctx, providerID, domain.BookingFilter{Limit: defaultBookingsLimit})
+		bookings, err := a.GetBookings(ctx, providerID, filter)
 		if err != nil {
 			return nil, err
 		}
@@ -426,29 +431,40 @@ func (a *Adapter) PreviewBookingCancel(ctx context.Context, providerID string, p
 		return nil, errors.Join(domain.ErrNotFound, fmt.Errorf("bookably adapter: booking %s not found", p.BookingID))
 	}
 
-	name := strings.ToLower(strings.TrimSpace(p.ClientName))
-	if name == "" {
-		return nil, errors.Join(domain.ErrValidation, errors.New("bookably adapter: client_name is required"))
-	}
-
-	now := time.Now().UTC()
-	lookback := now.Add(-defaultBookingsLookback)
-	future := now.Add(defaultBookingsLookback)
-	bookings, err := a.GetBookings(ctx, providerID, domain.BookingFilter{
-		From:  &lookback,
-		To:    &future,
-		Limit: defaultBookingsLimit,
-	})
+	bookings, err := a.GetBookings(ctx, providerID, filter)
 	if err != nil && !errors.Is(err, domain.ErrNotFound) {
 		return nil, err
 	}
 
+	nameNeedle := strings.ToLower(strings.TrimSpace(p.ClientName))
 	matches := make([]domain.Booking, 0)
 	for _, b := range bookings {
-		if strings.Contains(strings.ToLower(strings.TrimSpace(b.ClientName)), name) {
-			matches = append(matches, b)
+		if nameNeedle != "" && !strings.Contains(strings.ToLower(strings.TrimSpace(b.ClientName)), nameNeedle) {
+			continue
 		}
+		if hasExactTime && !cancelTimeMatches(b.At, exactTimeRef, true) {
+			continue
+		}
+		matches = append(matches, b)
 	}
+
+	if !hasExactTime && strings.TrimSpace(p.ApproximateTime) != "" {
+		approx, hasClock, parseErr := parseCancelApproximateTime(strings.TrimSpace(p.ApproximateTime))
+		if parseErr != nil {
+			return nil, parseErr
+		}
+		filtered := make([]domain.Booking, 0, len(matches))
+		for _, b := range matches {
+			if cancelTimeMatches(b.At, approx, hasClock) {
+				filtered = append(filtered, b)
+			}
+		}
+		matches = filtered
+	}
+
+	sort.Slice(matches, func(i, j int) bool {
+		return matches[i].At.Before(matches[j].At)
+	})
 
 	switch len(matches) {
 	case 0:
@@ -461,7 +477,14 @@ func (a *Adapter) PreviewBookingCancel(ctx context.Context, providerID string, p
 			RiskLevel:     domain.RiskHigh,
 		}, nil
 	default:
-		return nil, errors.Join(domain.ErrConflict, fmt.Errorf("bookably adapter: multiple bookings found for client %q", p.ClientName))
+		if len(matches) > 3 {
+			matches = matches[:3]
+		}
+		return &domain.Preview{
+			Summary:           "Multiple bookings matched for cancellation",
+			BookingCandidates: matches,
+			RiskLevel:         domain.RiskHigh,
+		}, nil
 	}
 }
 
@@ -907,4 +930,112 @@ func parseOptionalDateTimeUTC(candidates ...string) (time.Time, error) {
 		return time.Time{}, errors.Join(domain.ErrValidation, fmt.Errorf("bookably adapter: invalid datetime %q", value))
 	}
 	return time.Now().UTC(), nil
+}
+
+func buildCancelFilter(p domain.ActionParams, now time.Time) (domain.BookingFilter, time.Time, bool, error) {
+	filter := domain.BookingFilter{
+		Status:    "upcoming",
+		Direction: "future",
+		Limit:     defaultBookingsLimit,
+	}
+
+	if strings.TrimSpace(p.ApproximateTime) != "" {
+		approx, _, err := parseCancelApproximateTime(strings.TrimSpace(p.ApproximateTime))
+		if err != nil {
+			return domain.BookingFilter{}, time.Time{}, false, err
+		}
+		from, to := dayBoundsUTC(approx)
+		filter.From = &from
+		filter.To = &to
+		return clampCancelFilterRange(filter), approx, true, nil
+	}
+
+	if p.DateRange != nil && strings.TrimSpace(p.DateRange.From) != "" {
+		from, to, err := parseCancelDateRangeUTC(p.DateRange)
+		if err != nil {
+			return domain.BookingFilter{}, time.Time{}, false, err
+		}
+		filter.From = &from
+		filter.To = &to
+		return clampCancelFilterRange(filter), time.Time{}, false, nil
+	}
+
+	from := now.UTC()
+	to := from.Add(maxCancelSearchRange)
+	filter.From = &from
+	filter.To = &to
+	return filter, time.Time{}, false, nil
+}
+
+func parseCancelApproximateTime(raw string) (time.Time, bool, error) {
+	value := strings.TrimSpace(raw)
+	layoutsWithClock := []string{
+		time.RFC3339,
+		"2006-01-02T15:04:05",
+		"2006-01-02T15:04",
+	}
+	for _, layout := range layoutsWithClock {
+		if parsed, err := time.Parse(layout, value); err == nil {
+			return parsed.UTC(), true, nil
+		}
+	}
+	if parsed, err := time.Parse("2006-01-02", value); err == nil {
+		return parsed.UTC(), false, nil
+	}
+	return time.Time{}, false, errors.Join(domain.ErrValidation, fmt.Errorf("bookably adapter: invalid approximate_time %q", raw))
+}
+
+func parseCancelDateRangeUTC(r *domain.DateRange) (time.Time, time.Time, error) {
+	from, err := time.Parse("2006-01-02", strings.TrimSpace(r.From))
+	if err != nil {
+		return time.Time{}, time.Time{}, errors.Join(domain.ErrValidation, fmt.Errorf("bookably adapter: invalid cancel date_range.from: %w", err))
+	}
+	toRaw := strings.TrimSpace(r.To)
+	if toRaw == "" {
+		dayFrom, dayTo := dayBoundsUTC(from.UTC())
+		return dayFrom, dayTo, nil
+	}
+	to, err := time.Parse("2006-01-02", toRaw)
+	if err != nil {
+		return time.Time{}, time.Time{}, errors.Join(domain.ErrValidation, fmt.Errorf("bookably adapter: invalid cancel date_range.to: %w", err))
+	}
+	fromUTC := from.UTC()
+	toUTC := to.UTC().Add(dayEndDuration)
+	if toUTC.Before(fromUTC) {
+		return time.Time{}, time.Time{}, errors.Join(domain.ErrValidation, errors.New("bookably adapter: cancel date range is inverted"))
+	}
+	return fromUTC, toUTC, nil
+}
+
+func dayBoundsUTC(t time.Time) (time.Time, time.Time) {
+	day := time.Date(t.UTC().Year(), t.UTC().Month(), t.UTC().Day(), 0, 0, 0, 0, time.UTC)
+	return day, day.Add(dayEndDuration)
+}
+
+func clampCancelFilterRange(filter domain.BookingFilter) domain.BookingFilter {
+	if filter.From == nil || filter.To == nil {
+		return filter
+	}
+	from := filter.From.UTC()
+	to := filter.To.UTC()
+	maxTo := from.Add(maxCancelSearchRange)
+	if to.After(maxTo) {
+		to = maxTo
+	}
+	filter.From = &from
+	filter.To = &to
+	return filter
+}
+
+func cancelTimeMatches(bookingAt time.Time, reference time.Time, hasClock bool) bool {
+	b := bookingAt.UTC()
+	r := reference.UTC()
+	if hasClock {
+		diff := b.Sub(r)
+		if diff < 0 {
+			diff = -diff
+		}
+		return diff <= 6*time.Hour
+	}
+	return b.Year() == r.Year() && b.Month() == r.Month() && b.Day() == r.Day()
 }

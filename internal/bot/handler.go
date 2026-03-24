@@ -407,6 +407,10 @@ func (h *Handler) handleMessage(ctx context.Context, msg *telegramMessageUpdate)
 		return h.store.Save(ctx, s)
 	}
 
+	if plan.Intent == interpreter.IntentCancelBooking && plan.NeedsClarification() && hasCancelDateContext(plan.Params) {
+		plan.Clarifications = nil
+	}
+
 	if plan.NeedsClarification() {
 		s.ClarificationCount++
 		questionText := FormatClarification(plan.Clarifications[0].Question)
@@ -677,8 +681,9 @@ func (h *Handler) handleWritePreview(ctx context.Context, s *session.Session, pl
 		(preview.AvailabilityChange.AddedSlots+preview.AvailabilityChange.RemovedSlots > 20)
 
 	pending := SetPendingPlan(s, *plan, 0, "", &PendingPlanOptions{
-		SlotCandidates: preview.ProposedSlots,
-		Availability:   preview.AvailabilityExec,
+		SlotCandidates:    preview.ProposedSlots,
+		BookingCandidates: preview.BookingCandidates,
+		Availability:      preview.AvailabilityExec,
 	})
 	pending.IdempotencyKey = buildIdempotencyKey(chatID, pending.ID, plan.Intent)
 
@@ -700,6 +705,18 @@ func (h *Handler) handleWritePreview(ctx context.Context, s *session.Session, pl
 
 		keyboard := BuildSlotKeyboard(pending.ID, preview.ProposedSlots, location)
 		text := FormatCreatePreview(*preview, location)
+		msgID, finalizeErr := h.telegram.Finalize(ctx, chatID, text, &keyboard)
+		if finalizeErr != nil {
+			return finalizeErr
+		}
+		pending.PreviewMsgID = msgID
+		AppendHistory(s, "assistant", text)
+		return h.store.Save(ctx, s)
+	}
+
+	if plan.Intent == interpreter.IntentCancelBooking && len(preview.BookingCandidates) > 1 {
+		keyboard := BuildBookingCandidatesKeyboard(pending.ID, preview.BookingCandidates, location)
+		text := FormatCancelCandidates(preview.BookingCandidates, location)
 		msgID, finalizeErr := h.telegram.Finalize(ctx, chatID, text, &keyboard)
 		if finalizeErr != nil {
 			return finalizeErr
@@ -803,6 +820,8 @@ func (h *Handler) handleCallback(ctx context.Context, cb *telegramCallbackQueryU
 		return h.store.Save(ctx, s)
 	case CallbackTypeSlot:
 		return h.handleSlotSelection(ctx, s, parsed.SlotIndex)
+	case CallbackTypeBooking:
+		return h.handleBookingSelection(ctx, s, parsed.BookingIndex)
 	case CallbackTypeConfirm:
 		return h.handleConfirm(actorCtx, s)
 	default:
@@ -874,6 +893,58 @@ func (h *Handler) handleSlotSelection(ctx context.Context, s *session.Session, i
 	return h.store.Save(ctx, s)
 }
 
+func (h *Handler) handleBookingSelection(ctx context.Context, s *session.Session, idx int) error {
+	if s == nil || s.PendingPlan == nil {
+		return errors.New("bot handler: pending plan is required for booking selection")
+	}
+	if idx < 0 || idx >= len(s.PendingPlan.BookingCandidates) {
+		if _, err := h.telegram.SendText(ctx, s.ChatID, renderBody("Этот вариант уже недоступен\\. Выбери другой или сформируй запрос заново\\."), nil); err != nil {
+			return err
+		}
+		return nil
+	}
+
+	selectedRaw := s.PendingPlan.BookingCandidates[idx]
+	at, err := time.Parse(time.RFC3339, strings.TrimSpace(selectedRaw.At))
+	if err != nil {
+		return errors.Join(domain.ErrValidation, errors.New("bot handler: invalid pending booking candidate time"))
+	}
+
+	if err := h.clearPreviewKeyboard(ctx, s.ChatID, s.PendingPlan.PreviewMsgID); err != nil {
+		return err
+	}
+
+	pending := s.PendingPlan
+	pending.Plan.Intent = interpreter.IntentCancelBooking
+	pending.Plan.RequiresConfirm = true
+	pending.Plan.Params.BookingID = strings.TrimSpace(selectedRaw.ID)
+	pending.Plan.Params.ClientName = strings.TrimSpace(selectedRaw.ClientName)
+	pending.Plan.Params.ApproximateTime = at.UTC().Format(time.RFC3339)
+	pending.IdempotencyKey = buildIdempotencyKey(s.ChatID, pending.ID, pending.Plan.Intent)
+
+	location, _ := time.LoadLocation(s.Timezone)
+	if location == nil {
+		location = time.UTC
+	}
+	preview := domain.Preview{
+		BookingResult: &domain.Booking{
+			ID:          strings.TrimSpace(selectedRaw.ID),
+			ClientName:  strings.TrimSpace(selectedRaw.ClientName),
+			ServiceName: strings.TrimSpace(selectedRaw.ServiceName),
+			At:          at.UTC(),
+		},
+	}
+	text := FormatCancelPreview(preview)
+	keyboard := BuildPreviewKeyboard(pending.ID)
+	msgID, finalizeErr := h.telegram.Finalize(ctx, s.ChatID, text, &keyboard)
+	if finalizeErr != nil {
+		return finalizeErr
+	}
+	pending.PreviewMsgID = msgID
+	AppendHistory(s, "assistant", text)
+	return h.store.Save(ctx, s)
+}
+
 func (h *Handler) handleConfirm(ctx context.Context, s *session.Session) error {
 	if err := h.clearPreviewKeyboard(ctx, s.ChatID, s.PendingPlan.PreviewMsgID); err != nil {
 		return err
@@ -886,12 +957,7 @@ func (h *Handler) handleConfirm(ctx context.Context, s *session.Session) error {
 	if err != nil {
 		h.logError(s.ChatID, string(s.PendingPlan.Plan.Intent), "bot/handler", time.Now(), errorKind(err), err, map[string]any{"stage": "execute_confirmed"})
 		if errors.Is(err, ErrExecutionPolicyViolation) {
-			_, sendErr := h.telegram.SendText(ctx, s.ChatID, buildStructuredResponse(
-				"Команда подтверждена.",
-				"Проверил ограничения выполнения.",
-				"ACP отклонил выполнение по policy.",
-				"Проверь формулировку команды и повтори запрос.",
-			), nil)
+			_, sendErr := h.telegram.SendText(ctx, s.ChatID, renderBody("Команду получил, но ACP отклонил выполнение по policy.\nПроверь формулировку и попробуй снова."), nil)
 			return sendErr
 		}
 		if errors.Is(err, ErrExecutionContractBlocked) {
@@ -901,12 +967,7 @@ func (h *Handler) handleConfirm(ctx context.Context, s *session.Session) error {
 					{NewWebAppButton("Открыть в приложении →", link)},
 				},
 			}
-			if _, sendErr := h.telegram.SendText(ctx, s.ChatID, buildStructuredResponse(
-				"Команда подтверждена.",
-				"Проверил доступность исполнения по текущему API-контракту.",
-				"Эта операция временно недоступна в чате.",
-				"Открой приложение кнопкой ниже и выполни действие там.",
-			), &keyboard); sendErr != nil {
+			if _, sendErr := h.telegram.SendText(ctx, s.ChatID, renderBody("Эту операцию пока нельзя завершить в чате из-за ограничений API.\nОткрой приложение кнопкой ниже — там действие доступно."), &keyboard); sendErr != nil {
 				return sendErr
 			}
 			ClearPendingPlan(s)
@@ -932,12 +993,7 @@ func (h *Handler) handleConfirm(ctx context.Context, s *session.Session) error {
 	if result != nil && strings.TrimSpace(result.Message) != "" {
 		actionMessage = strings.TrimSpace(result.Message)
 	}
-	message := buildStructuredResponse(
-		"Подтверждение получено.",
-		"Выполнил команду через ACP.",
-		actionMessage,
-		"Можно отправить следующую команду в чат.",
-	)
+	message := renderBody(actionMessage + "\nМожно отправить следующую команду в чат.")
 	if _, err := h.telegram.SendText(ctx, s.ChatID, message, nil); err != nil {
 		return err
 	}
@@ -987,12 +1043,7 @@ func (h *Handler) sendDeepLinkEscalation(ctx context.Context, s *session.Session
 			{NewWebAppButton("Открыть в приложении →", link)},
 		},
 	}
-	text := buildStructuredResponse(
-		"Для этого сценария чат ограничен.",
-		"Подготовил быстрый переход в приложение.",
-		"Команда в чате не выполнена.",
-		"Открой Mini App кнопкой ниже и продолжи там.",
-	)
+	text := renderBody("Этот сценарий удобнее завершить в приложении.\nОткрой Mini App кнопкой ниже — контекст уже передан.")
 	if _, err := h.telegram.SendText(ctx, chatID, text, &keyboard); err != nil {
 		return err
 	}
@@ -1084,6 +1135,16 @@ func mapActionParams(p interpreter.ActionParams) domain.ActionParams {
 		}
 	}
 	return out
+}
+
+func hasCancelDateContext(p interpreter.ActionParams) bool {
+	if strings.TrimSpace(p.ApproximateTime) != "" {
+		return true
+	}
+	if p.DateRange != nil && strings.TrimSpace(p.DateRange.From) != "" {
+		return true
+	}
+	return false
 }
 
 func (h *Handler) withActorContext(ctx context.Context, s *session.Session) context.Context {

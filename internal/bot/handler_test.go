@@ -636,6 +636,56 @@ func TestHandlerWriteIntentBuildsPreviewAndPendingPlan(t *testing.T) {
 	}
 }
 
+func TestHandlerCancelPreviewWithCandidatesShowsSelectionKeyboard(t *testing.T) {
+	store := newInMemorySessionStore()
+	seedSession(t, store, &session.Session{ChatID: 1400, TelegramUserID: 4440, ProviderID: "spec-1", Timezone: "UTC"})
+
+	interp := &mockInterpreter{fn: func(ctx context.Context, userMessage string, convo interpreter.ConversationContext) (*interpreter.ActionPlan, error) {
+		return &interpreter.ActionPlan{
+			Intent:     interpreter.IntentCancelBooking,
+			Confidence: 0.92,
+			Params: interpreter.ActionParams{
+				DateRange: &interpreter.DateRange{From: "2026-04-01", To: "2026-04-01"},
+			},
+		}, nil
+	}}
+	provider := &mockProvider{
+		previewBookingCancelFn: func(ctx context.Context, providerID string, p domain.ActionParams) (*domain.Preview, error) {
+			return &domain.Preview{
+				BookingCandidates: []domain.Booking{
+					{ID: "b1", ClientName: "Иван", ServiceName: "Стрижка", At: time.Date(2026, 4, 1, 11, 0, 0, 0, time.UTC)},
+					{ID: "b2", ClientName: "Марина", ServiceName: "Маникюр", At: time.Date(2026, 4, 1, 14, 0, 0, 0, time.UTC)},
+				},
+				RiskLevel: domain.RiskHigh,
+			}, nil
+		},
+	}
+	tg := newMockTelegramGateway()
+	h := newTestHandler(t, store, interp, provider, nil, tg)
+
+	rec := sendWebhook(t, h, "secret", makeMessageBody(t, 1400, 4440, "Отмени запись на 1 апреля"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	if len(tg.finalizeCalls) != 1 {
+		t.Fatalf("expected one finalize call, got %d", len(tg.finalizeCalls))
+	}
+	saved, err := store.Get(context.Background(), 1400)
+	if err != nil {
+		t.Fatalf("store.Get: %v", err)
+	}
+	if saved.PendingPlan == nil || len(saved.PendingPlan.BookingCandidates) != 2 {
+		t.Fatalf("expected pending booking candidates saved, got %+v", saved.PendingPlan)
+	}
+	kb := tg.finalizeCalls[0].Keyboard
+	if kb == nil || len(kb.InlineKeyboard) < 2 {
+		t.Fatalf("expected selection keyboard, got %#v", kb)
+	}
+	if kb.InlineKeyboard[0][0].CallbackData != BookingData(0, saved.PendingPlan.ID) {
+		t.Fatalf("unexpected booking callback data: %q", kb.InlineKeyboard[0][0].CallbackData)
+	}
+}
+
 func TestHandlerWriteIntentLargeImpactWarnsButKeepsConfirm(t *testing.T) {
 	store := newInMemorySessionStore()
 	seedSession(t, store, &session.Session{ChatID: 1401, TelegramUserID: 4441, ProviderID: "spec-1", Timezone: "UTC"})
@@ -858,6 +908,54 @@ func TestHandlerCallbackSlotSelectionUsesPendingSnapshot(t *testing.T) {
 	}
 	if provider.FindSlotsCallCount() != 0 {
 		t.Fatalf("expected zero provider.FindSlots calls, got %d", provider.FindSlotsCallCount())
+	}
+}
+
+func TestHandlerCallbackBookingSelectionUsesPendingSnapshot(t *testing.T) {
+	store := newInMemorySessionStore()
+	now := time.Date(2026, 4, 1, 9, 0, 0, 0, time.UTC)
+	seedSession(t, store, &session.Session{
+		ChatID:         1801,
+		TelegramUserID: 8801,
+		ProviderID:     "spec-1",
+		Timezone:       "UTC",
+		PendingPlan: &session.PendingPlan{
+			ID:           "plan-book",
+			PreviewMsgID: 101,
+			CreatedAt:    now,
+			Plan: interpreter.ActionPlan{
+				Intent: interpreter.IntentCancelBooking,
+			},
+			BookingCandidates: []session.PendingBookingCandidate{
+				{ID: "b1", ClientName: "Иван", ServiceName: "Стрижка", At: now.Add(2 * time.Hour).Format(time.RFC3339)},
+				{ID: "b2", ClientName: "Марина", ServiceName: "Маникюр", At: now.Add(5 * time.Hour).Format(time.RFC3339)},
+			},
+		},
+	})
+
+	tg := newMockTelegramGateway()
+	h := newTestHandler(t, store, nil, nil, nil, tg)
+
+	rec := sendWebhook(t, h, "secret", makeCallbackBody(t, 1801, 8801, "cb-book", BookingData(1, "plan-book"), 101))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	saved, err := store.Get(context.Background(), 1801)
+	if err != nil {
+		t.Fatalf("store.Get: %v", err)
+	}
+	if saved.PendingPlan == nil {
+		t.Fatal("expected pending plan after booking selection")
+	}
+	if saved.PendingPlan.Plan.Params.BookingID != "b2" {
+		t.Fatalf("expected selected booking id b2, got %q", saved.PendingPlan.Plan.Params.BookingID)
+	}
+	if len(tg.finalizeCalls) == 0 || tg.finalizeCalls[len(tg.finalizeCalls)-1].Keyboard == nil {
+		t.Fatalf("expected finalize with confirm keyboard, got %#v", tg.finalizeCalls)
+	}
+	lastKB := tg.finalizeCalls[len(tg.finalizeCalls)-1].Keyboard
+	if len(lastKB.InlineKeyboard) == 0 || len(lastKB.InlineKeyboard[0]) != 2 {
+		t.Fatalf("expected confirm/cancel row, got %#v", lastKB)
 	}
 }
 

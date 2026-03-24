@@ -286,11 +286,13 @@ func TestPreviewBookingCreate(t *testing.T) {
 }
 
 func TestPreviewBookingCancelSingleMultipleAndNotFound(t *testing.T) {
+	var queries []url.Values
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != endpointSpecialistBookings {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
+		queries = append(queries, r.URL.Query())
 		_, _ = io.WriteString(w, `{"bookings":[
 			{"id":"b1","status":"CONFIRMED","client":{"firstName":"Иван","lastName":"Петров"},"service":{"title":"Стрижка"},"slot":{"startAt":"2026-03-27T11:00:00Z","endAt":"2026-03-27T11:30:00Z"}},
 			{"id":"b2","status":"CONFIRMED","client":{"firstName":"Марина"},"service":{"title":"Маникюр"},"slot":{"startAt":"2026-03-28T14:00:00Z","endAt":"2026-03-28T15:00:00Z"}},
@@ -309,14 +311,65 @@ func TestPreviewBookingCancelSingleMultipleAndNotFound(t *testing.T) {
 		t.Fatalf("expected b1 result, got %+v", one.BookingResult)
 	}
 
-	_, err = adapter.PreviewBookingCancel(testActorContext(), "spec-1", domain.ActionParams{ClientName: "Марина"})
-	if err == nil || !errors.Is(err, domain.ErrConflict) {
-		t.Fatalf("expected ErrConflict for multiple matches, got %v", err)
+	multiple, err := adapter.PreviewBookingCancel(testActorContext(), "spec-1", domain.ActionParams{ClientName: "Марина"})
+	if err != nil {
+		t.Fatalf("PreviewBookingCancel multiple: %v", err)
+	}
+	if len(multiple.BookingCandidates) != 2 {
+		t.Fatalf("expected 2 booking candidates, got %+v", multiple.BookingCandidates)
+	}
+	if multiple.BookingCandidates[0].ID != "b2" || multiple.BookingCandidates[1].ID != "b3" {
+		t.Fatalf("unexpected candidate order: %+v", multiple.BookingCandidates)
 	}
 
 	_, err = adapter.PreviewBookingCancel(testActorContext(), "spec-1", domain.ActionParams{ClientName: "Кирилл"})
 	if err == nil || !errors.Is(err, domain.ErrNotFound) {
 		t.Fatalf("expected ErrNotFound for unknown client, got %v", err)
+	}
+
+	if len(queries) == 0 {
+		t.Fatal("expected specialist bookings request")
+	}
+	fromRaw := queries[0].Get("from")
+	toRaw := queries[0].Get("to")
+	if fromRaw == "" || toRaw == "" {
+		t.Fatalf("expected bounded cancel window query, got from=%q to=%q", fromRaw, toRaw)
+	}
+	from, err := time.Parse(time.RFC3339, fromRaw)
+	if err != nil {
+		t.Fatalf("parse from: %v", err)
+	}
+	to, err := time.Parse(time.RFC3339, toRaw)
+	if err != nil {
+		t.Fatalf("parse to: %v", err)
+	}
+	if to.Sub(from) > 31*24*time.Hour {
+		t.Fatalf("cancel preview range must be <= 31d, got %s", to.Sub(from))
+	}
+}
+
+func TestPreviewBookingCancelDateFirstFiltersByApproximateTime(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != endpointSpecialistBookings {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		_, _ = io.WriteString(w, `{"bookings":[
+			{"id":"b1","status":"CONFIRMED","client":{"firstName":"Иван"},"service":{"title":"Стрижка"},"slot":{"startAt":"2026-04-01T11:00:00Z","endAt":"2026-04-01T11:30:00Z"}},
+			{"id":"b2","status":"CONFIRMED","client":{"firstName":"Алина"},"service":{"title":"Массаж"},"slot":{"startAt":"2026-04-01T18:00:00Z","endAt":"2026-04-01T19:00:00Z"}}
+		]}`)
+	}))
+	defer server.Close()
+
+	adapter := newTestAdapter(t, server.URL, nil)
+	preview, err := adapter.PreviewBookingCancel(testActorContext(), "spec-1", domain.ActionParams{
+		ApproximateTime: "2026-04-01T11:20:00",
+	})
+	if err != nil {
+		t.Fatalf("PreviewBookingCancel date-first: %v", err)
+	}
+	if preview.BookingResult == nil || preview.BookingResult.ID != "b1" {
+		t.Fatalf("expected booking b1 for time window, got %+v", preview.BookingResult)
 	}
 }
 

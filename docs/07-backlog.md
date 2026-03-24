@@ -1035,5 +1035,25 @@ Acceptance criteria:
   - `create_booking` execution remains contract-blocked (deep-link fallback);
   - availability writes remain strict-real via commit payload.
 
+## Iteration 18 note (Cancel/write recovery + human UX, 2026-03-24)
+
+- `cancel_booking` preview fixed to safe search windows (`<=31 days`) and no longer queries unsupported wide ranges.
+- Cancel resolution moved to date-first behavior:
+  - supports date/day window and approximate time filtering;
+  - returns `BookingCandidates` (up to 3) instead of immediate conflict error when multiple matches exist.
+- Bot callback contract extended:
+  - new callback type `booking:{idx}:{planID}`;
+  - pending plan now stores booking candidate snapshot for deterministic selection before confirm.
+- Handler flow updated for multi-candidate cancel:
+  - first step shows candidate list with inline buttons;
+  - after selection, pending plan is pinned with `booking_id` and final `confirm/cancel` keyboard is shown.
+- Formatter baseline switched to natural, intent-specific responses:
+  - removed rigid universal section frame;
+  - human date formatting (`12 апреля, 14:30`) and focused bold key entities retained.
+- Regression status for this iteration:
+  - `go test ./internal/bookably/... -v` passed;
+  - `go test ./internal/bot/... -v` passed;
+  - `go test ./...`, `go vet ./...`, `go build ./...` passed.
+
 Update `status` fields and checkboxes as tasks are completed.  
 Blocked count is now zero in backlog status; backend create-booking contract gap is tracked as a runtime limitation note.

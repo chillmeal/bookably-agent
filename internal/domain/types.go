@@ -76,6 +76,7 @@ type Preview struct {
 	Conflicts          []Conflict                    `json:"conflicts,omitempty"`
 	ProposedSlots      []Slot                        `json:"proposed_slots,omitempty"`
 	BookingResult      *Booking                      `json:"booking_result,omitempty"`
+	BookingCandidates  []Booking                     `json:"booking_candidates,omitempty"`
 	RiskLevel          RiskLevel                     `json:"risk_level"`
 }
 
